@@ -1,0 +1,2 @@
+[console_scripts]
+slipcover = slipcover.__main__:main

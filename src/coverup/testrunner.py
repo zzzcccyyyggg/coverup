@@ -23,7 +23,7 @@ async def measure_test_coverage(*, test: str, tests_dir: Path, pytest_args='',
                                           '--json', '--out', j.name,
                                           '-m', 'pytest', *pytest_args.split(),
                                           *(('--isolate',) if isolate_tests else ()),
-                                          '-qq', '-x', '--disable-warnings', t.name],
+                                          '-qq', '--disable-warnings', t.name],
                                          check=True, timeout=60)
                 if log_write:
                     log_write(str(p.stdout, 'UTF-8', errors='ignore'))
@@ -41,31 +41,42 @@ async def measure_test_coverage(*, test: str, tests_dir: Path, pytest_args='',
 
 
 def measure_suite_coverage(*, tests_dir: Path, source_dir: T.Optional[Path], pytest_args='',
-                           trace=None, isolate_tests=False, branch_coverage=True):
+                           trace=None, isolate_tests=False, branch_coverage=True,
+                           raise_on_failure: bool = True):
     """Runs an entire test suite and returns the coverage obtained."""
 
     with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as j:
         try:
             command = [sys.executable,
-                       '-m', 'slipcover',
-                             *(('--source', source_dir) if source_dir else ()),
-                             *(('--branch',) if branch_coverage else ()),
-                             '--json', '--out', j.name,
-                       '-m', 'pytest', *pytest_args.split(), *(('--isolate',) if isolate_tests else ()),
-                             '--disable-warnings', '-x', tests_dir]
+                 '-m', 'slipcover',
+                     *(('--source', source_dir) if source_dir else ()),
+                     *(('--branch',) if branch_coverage else ()),
+                     '--json', '--out', j.name,
+                 '-m', 'pytest', *pytest_args.split(), *(('--isolate',) if isolate_tests else ()),
+                     '--disable-warnings', tests_dir]
 
             if trace: trace(command)
             p = subprocess.run(command, check=False, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             if p.returncode not in (pytest.ExitCode.OK, pytest.ExitCode.NO_TESTS_COLLECTED):
                 if trace: trace(f"tests rc={p.returncode}\n" + str(p.stdout, 'utf-8'))
-                p.check_returncode()
+                if raise_on_failure:
+                    p.check_returncode()
+                else:
+                    # Do not raise; return empty coverage to allow caller to continue.
+                    try:
+                        return json.load(j)
+                    except json.decoder.JSONDecodeError:
+                        return {"files": {}}
 
             try:
                 return json.load(j)
             except json.decoder.JSONDecodeError:
                 # The JSON is broken, so pytest's execution likely aborted (e.g. a Python unhandled exception).
-                p.check_returncode() # this will almost certainly raise an exception. If not, we do it ourselves:
-                raise subprocess.CalledProcessError(p.returncode, command, output=p.stdout)
+                if raise_on_failure:
+                    p.check_returncode() # this will almost certainly raise an exception. If not, we do it ourselves:
+                    raise subprocess.CalledProcessError(p.returncode, command, output=p.stdout)
+                else:
+                    return {"files": {}}
         finally:
             j.close()
 

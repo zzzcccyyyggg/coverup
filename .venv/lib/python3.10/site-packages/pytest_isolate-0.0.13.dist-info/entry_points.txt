@@ -1,0 +1,2 @@
+[pytest11]
+pytest_isolate = pytest_isolate.plugin

@@ -1,0 +1,5 @@
+[console_scripts]
+cleanslate-reduce = pytest_cleanslate.reduce:main
+
+[pytest11]
+pytest_cleanslate = pytest_cleanslate.plugin

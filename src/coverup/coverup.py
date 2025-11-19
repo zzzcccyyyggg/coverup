@@ -2,20 +2,23 @@ import asyncio
 import json
 
 import argparse
+import os
 import subprocess
-import re
 import sys
 import typing as T
 
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
 from . import llm
-from .segment import *
+from .languages.base import LanguageBackend
+from .languages.go_backend import GoBackend
+from .languages.python_backend import PythonBackend
+from .segment import CodeSegment
 from .prompt.prompter import Prompter
-from .testrunner import *
 from .version import __version__
-from .utils import summary_coverage
+from .utils import format_branches, summary_coverage
+from .python_support import get_required_modules
 
 
 def get_prompters() -> dict[str, T.Callable[[T.Any], Prompter]]:
@@ -25,6 +28,7 @@ def get_prompters() -> dict[str, T.Callable[[T.Any], Prompter]]:
     from .prompt.gpt_v2 import GptV2Prompter
     from .prompt.gpt_v2_ablated import GptV2AblatedPrompter
     from .prompt.claude import ClaudePrompter
+    from .prompt.gpt_go_v1 import GoGptV1Prompter
 
     return {
         "gpt-v1": GptV1Prompter,
@@ -35,7 +39,8 @@ def get_prompters() -> dict[str, T.Callable[[T.Any], Prompter]]:
         "gpt-v2-ablated": \
             lambda cmd_args: GptV2AblatedPrompter(cmd_args,
                 with_coverage=False, with_get_info=False, with_imports=False, with_error_fixing=False),
-        "claude": ClaudePrompter
+        "claude": ClaudePrompter,
+        "gpt-go-v1": GoGptV1Prompter,
     }
 
 
@@ -48,24 +53,27 @@ def parse_args(args=None):
     ap.add_argument('source_files', type=Path, nargs='*',
                     help='only process certain source file(s)')
 
-    def Path_dir(value):
+    def Path_existing_dir(value):
         path_dir = Path(value).resolve()
         if not path_dir.is_dir(): raise argparse.ArgumentTypeError(f"\"{value}\" must be a directory")
         return path_dir
 
-    ap.add_argument('--tests-dir', type=Path_dir, default='tests',
+    ap.add_argument('--tests-dir', type=lambda value: Path(value).resolve(), default=None,
                     help='directory where tests reside')
 
     g = ap.add_mutually_exclusive_group(required=False)
-    g.add_argument('--package-dir', type=Path_dir,
+    g.add_argument('--package-dir', type=Path_existing_dir,
                     help='directory with the package sources (e.g., src/flask)')
-    g.add_argument('--source-dir', type=Path_dir, dest='package_dir', help=argparse.SUPPRESS)
+    g.add_argument('--source-dir', type=Path_existing_dir, dest='package_dir', help=argparse.SUPPRESS)
+
+    ap.add_argument('--language', type=str, choices=['python', 'go'], default='python',
+                    help='target language for coverage improvement')
 
     ap.add_argument('--checkpoint', type=Path, 
                     help=f'path to save progress to (and to resume it from)')
     ap.add_argument('--no-checkpoint', action='store_const', const=None, dest='checkpoint', default=argparse.SUPPRESS,
-                    help='disable checkpoint')
-
+                    help='disable checkpoint')  
+    # default 
     def default_model():
         if 'OPENAI_API_KEY' in os.environ:
             return "gpt-4o"
@@ -116,6 +124,8 @@ def parse_args(args=None):
 
     ap.add_argument('--pytest-args', type=str, default='',
                     help='extra arguments to pass to pytest')
+    ap.add_argument('--go-test-args', type=str, default='',
+                    help='extra arguments to pass to go test')
 
     ap.add_argument('--install-missing-modules', default=False,
                     action=argparse.BooleanOptionalAction,
@@ -159,6 +169,14 @@ def parse_args(args=None):
                     action=argparse.BooleanOptionalAction,
                     help=argparse.SUPPRESS)
 
+    ap.add_argument('--skip-suite-measurement', default=False,
+                    action=argparse.BooleanOptionalAction,
+                    help='skip running the existing test suite for baseline/final coverage')
+
+    ap.add_argument('--continue-on-failure', default=False,
+                    action=argparse.BooleanOptionalAction,
+                    help='do not abort CoverUp when the test suite returns a non-zero exit code; continue processing')
+
     def positive_int(value):
         ivalue = int(value)
         if ivalue < 0: raise argparse.ArgumentTypeError("must be a number >= 0")
@@ -167,7 +185,7 @@ def parse_args(args=None):
     ap.add_argument('--max-concurrency', type=positive_int, default=50,
                     help='maximum number of parallel requests; 0 means unlimited')
 
-    ap.add_argument('--save-coverage-to', type=Path_dir,
+    ap.add_argument('--save-coverage-to', type=Path_existing_dir,
                     help='save each new test\'s coverage to given directory')
 
     ap.add_argument('--version', action='version',
@@ -175,86 +193,81 @@ def parse_args(args=None):
 
     args = ap.parse_args(args)
 
-    for i in range(len(args.source_files)):
-        if not args.source_files[i].is_file() or args.source_files[i].suffix != '.py':
-            ap.error(f'All source files given must be Python sources; offending file: "{args.source_files[i]}".')
+    if not args.model:
+        ap.error('Specify the model to use with --model')
 
-        args.source_files[i] = args.source_files[i].resolve()
+    if args.tests_dir is None:
+        args.tests_dir = Path('tests').resolve()
+    else:
+        args.tests_dir = args.tests_dir.resolve()
 
     if args.disable_failing and args.disable_polluting:
         ap.error('Specify only one of --disable-failing and --disable-polluting')
 
-    if not args.model:
-        ap.error('Specify the model to use with --model')
+    args.language = args.language.lower()
 
-    if args.package_dir:
-        # use parent of package dir as base so that its name is included in module paths
-        args.src_base_dir = args.package_dir.parent
-        if not list(args.package_dir.glob("*.py")):
-            sources = sorted(args.package_dir.glob("**/*.py"), key=lambda p: len(p.parts))
-            suggestion = sources[0].parent if sources else None
+    if args.language == 'python':
+        for i in range(len(args.source_files)):
+            if not args.source_files[i].is_file() or args.source_files[i].suffix != '.py':
+                ap.error(f'All source files given must be Python sources; offending file: "{args.source_files[i]}".')
 
-            try:
-                args.package_dir = args.package_dir.relative_to(Path.cwd())
-                suggestion = suggestion.relative_to(Path.cwd()) if suggestion else None
-            except ValueError:
-                pass
+            args.source_files[i] = args.source_files[i].resolve()
 
-            ap.error(f'No Python sources found in "{args.package_dir}"' +
-                     (f'; did you mean "{suggestion}"?' if suggestion else '.'))
+        if args.package_dir:
+            args.src_base_dir = args.package_dir.parent
+            if not list(args.package_dir.glob("*.py")):
+                sources = sorted(args.package_dir.glob("**/*.py"), key=lambda p: len(p.parts))
+                suggestion = sources[0].parent if sources else None
 
-    elif args.source_files:
-        if len({p.parent for p in args.source_files}) > 1:
-            ap.error('All source files must be in the same directory unless --package-dir is given.')
+                try:
+                    args.package_dir = args.package_dir.relative_to(Path.cwd())
+                    suggestion = suggestion.relative_to(Path.cwd()) if suggestion else None
+                except ValueError:
+                    pass
 
-        # use the directory itself as base, as these file(s) are not obviously part of anything
-        args.src_base_dir = args.source_files[0].parent
+                ap.error(f'No Python sources found in "{args.package_dir}"' +
+                         (f'; did you mean "{suggestion}"?' if suggestion else '.'))
+
+        elif args.source_files:
+            if len({p.parent for p in args.source_files}) > 1:
+                ap.error('All source files must be in the same directory unless --package-dir is given.')
+
+            args.src_base_dir = args.source_files[0].parent
+        else:
+            ap.error('Specify either --package-dir or a file name')
+
+        if not args.tests_dir.exists():
+            ap.error(f'Directory "{args.tests_dir}" does not exist. Please specify the correct one or create it.')
+
+    elif args.language == 'go':
+        if args.source_files:
+            ap.error('Specifying individual source files is not supported for Go projects; use --package-dir.')
+
+        if not args.package_dir:
+            ap.error('Go support requires --package-dir pointing to the module root.')
+
+        args.src_base_dir = args.package_dir
+        args.tests_dir = args.package_dir
+        args.branch_coverage = False
+        args.install_missing_modules = False
+        args.add_to_pythonpath = False
+
+        if args.disable_polluting or args.disable_failing:
+            ap.error('Go backend does not support --disable-polluting or --disable-failing yet.')
+
+        if args.prompt == 'gpt-v2' and '--prompt' not in sys.argv:
+            args.prompt = 'gpt-go-v1'
+
     else:
-        ap.error('Specify either --package-dir or a file name')
+        ap.error(f'Unsupported language "{args.language}"')
 
     return args
 
 
-def test_file_path(args, test_seq: int) -> Path:
-    """Returns the Path for a test's file, given its sequence number."""
-    return args.tests_dir / f"test_{args.prefix}_{test_seq}.py"
+def add_to_pythonpath(dir: Path) -> None:
+    from .python_support import add_to_pythonpath as _add
 
-
-test_seq: int = 1
-def new_test_file(args: argparse.Namespace):
-    """Creates a new test file, returning its Path."""
-
-    global test_seq
-
-    while True:
-        p = test_file_path(args, test_seq)
-        if not (p.exists() or (p.parent / ("disabled_" + p.name)).exists()):
-            try:
-                p.touch(exist_ok=False)
-                return p
-            except FileExistsError:
-                pass
-
-        test_seq += 1
-
-
-def clean_error(error: str) -> str:
-    """Conservatively removes pytest-generated (and possibly other) output not needed by GPT,
-       to cut down on token use.  Conservatively: if the format isn't recognized, leave it alone."""
-
-    if (match := re.search(r"=====+ (?:FAILURES|ERRORS) ===+\n" +\
-                           r"___+ [^\n]+ _+___\n" +\
-                           r"\n?" +\
-                           r"(.*)", error,
-                           re.DOTALL)):
-        error = match.group(1)
-
-    if (match := re.search(r"(.*\n)" +\
-                           r"===+ short test summary info ===+", error,
-                           re.DOTALL)):
-        error = match.group(1)
-
-    return error
+    _add(dir)
 
 
 log_file = None
@@ -311,76 +324,6 @@ def check_whole_suite(args: argparse.Namespace) -> None:
         for t in to_disable:
             print(f"Disabling {t}")
             t.rename(t.parent / ("disabled_" + t.name))
-
-
-def find_imports(python_code: str) -> T.List[str]:
-    """Collects a list of packages needed by a program by examining its 'import' statements"""
-    import ast
-
-    try:
-        t = ast.parse(python_code)
-    except SyntaxError:
-        return []
-
-    modules = []
-
-    for n in ast.walk(t):
-        if isinstance(n, ast.Import):
-            for name in n.names:
-                if isinstance(name, ast.alias):
-                    modules.append(name.name.split('.')[0])
-
-        elif isinstance(n, ast.ImportFrom):
-            if n.module and n.level == 0:
-                modules.append(n.module.split('.')[0])
-
-    return [m for m in modules if m != '__main__']
-
-
-module_available = dict()
-def missing_imports(modules: T.List[str]) -> T.List[str]:
-    # TODO handle GPT sometimes generating 'from your_module import XYZ', asking us to modify
-
-    import importlib.util
-
-    for module in modules:
-        if module not in module_available:
-            spec = importlib.util.find_spec(module)
-            module_available[module] = 0 if spec is None else 1
-
-    return [m for m in modules if not module_available[m]]
-
-
-def install_missing_imports(args: argparse.Namespace, seg: CodeSegment, modules: T.List[str]) -> bool: 
-    global module_available
-
-    import importlib.metadata
-
-    all_ok = True
-    for module in modules:
-        try:
-            # FIXME we probably want to limit the module(s) installed to an "approved" list
-            p = subprocess.run((f"{sys.executable} -m pip install {module}").split(),
-                               check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60)
-            version = importlib.metadata.version(module)
-            module_available[module] = 2    # originally unavailable, but now added
-            print(f"Installed module {module} {version}")
-            log_write(args, seg, f"Installed module {module} {version}")
-
-            if args.write_requirements_to:
-                with args.write_requirements_to.open("a") as f:
-                    f.write(f"{module}=={version}\n")
-        except subprocess.CalledProcessError as e:
-            log_write(args, seg, f"Unable to install module {module}:\n{str(e.stdout, 'UTF-8', errors='ignore')}")
-            all_ok = False
-
-    return all_ok
-
-
-def get_required_modules() -> T.List[str]:
-    """Returns a list of the modules found missing (and not installed)"""
-    return [m for m in module_available if not module_available[m]]
-
 
 PROGRESS_COUNTERS=['G', 'F', 'U', 'R']  # good, failed, useless, retry
 class Progress:
@@ -523,6 +466,7 @@ state: State
 
 async def improve_coverage(
     args: argparse.Namespace,
+    backend: LanguageBackend,
     chatter: llm.Chatter,
     prompter: Prompter,
     seg: CodeSegment
@@ -548,24 +492,23 @@ async def improve_coverage(
         response_message = response["choices"][0]["message"]
         messages.append(response_message)
 
-        if '```python' in response_message['content']:
-            last_test = extract_python(response_message['content'])
-        else:
-            log_write(args, seg, "No Python code in GPT response, giving up")
+        if not (last_test := backend.extract_test_code(response_message['content'])):
+            log_write(args, seg, "No test code in model response, giving up")
             break
 
-        if missing := missing_imports(find_imports(last_test)):
-            log_write(args, seg, f"Missing modules {' '.join(missing)}")
-            if not args.install_missing_modules or not install_missing_imports(args, seg, missing):
-                return False # not finished: needs a missing module
+        log_cb = lambda message: log_write(args, seg, message)
+
+        if not backend.handle_missing_dependencies(seg, last_test, log_cb):
+            return False
 
         try:
-            pytest_args = (f"--count={args.repeat_tests} " if args.repeat_tests else "") + args.pytest_args
-            coverage = await measure_test_coverage(test=last_test, tests_dir=args.tests_dir,
-                                                 pytest_args=pytest_args,
-                                                 isolate_tests=args.isolate_tests,
-                                                 branch_coverage=args.branch_coverage,
-                                                 log_write=lambda msg: log_write(args, seg, msg))
+            coverage = await backend.measure_test_coverage(
+                seg,
+                last_test,
+                isolate_tests=args.isolate_tests,
+                branch_coverage=args.branch_coverage,
+                log_write=log_cb,
+            )
 
         except subprocess.TimeoutExpired:
             log_write(args, seg, "measure_coverage timed out")
@@ -575,7 +518,7 @@ async def improve_coverage(
 
         except subprocess.CalledProcessError as e:
             state.inc_counter('F')
-            error = clean_error(str(e.stdout, 'UTF-8', errors='ignore'))
+            error = backend.format_test_error(str(e.stdout, 'UTF-8', errors='ignore') if e.stdout else str(e))
             if not (prompts := prompter.error_prompt(seg, error)):
                 log_write(args, seg, "Test failed:\n\n" + error)
                 break
@@ -610,17 +553,13 @@ async def improve_coverage(
         asked = {'lines': sorted(seg.missing_lines), 'branches': sorted(seg.missing_branches)}
         gained = {'lines': sorted(gained_lines), 'branches': sorted(gained_branches)}
 
-        new_test = new_test_file(args)
-        new_test.write_text(f"# file: {seg.identify()}\n" +\
-                            f"# asked: {json.dumps(asked)}\n" +\
-                            f"# gained: {json.dumps(gained)}\n\n" +\
-                            last_test)
-
-        log_write(args, seg, f"Saved as {new_test}\n")
+        new_test_path = backend.save_successful_test(seg, last_test, asked, gained)
+        log_write(args, seg, f"Saved as {new_test_path}\n")
         state.inc_counter('G')
 
         if args.save_coverage_to:
-            with (args.save_coverage_to / (new_test.stem + ".json")).open("w") as f:
+            target_path = Path(new_test_path)
+            with (args.save_coverage_to / (target_path.stem + ".json")).open("w") as f:
                 json.dump(coverage, f)
 
         # TODO re-add segment with remaining missing coverage?
@@ -629,26 +568,22 @@ async def improve_coverage(
     return True # finished
 
 
-def add_to_pythonpath(dir: Path):
-    import os
-    os.environ['PYTHONPATH'] = str(dir) + (f":{os.environ['PYTHONPATH']}" if 'PYTHONPATH' in os.environ else "")
-    sys.path.insert(0, str(dir))
-
-
 def main():
-    from collections import defaultdict
-    import os
-
     global state
     args = parse_args()
 
-    if not args.tests_dir.exists():
-        print(f'Directory "{args.tests_dir}" does not exist. Please specify the correct one or create it.')
-        return 1
+    backend_map: dict[str, type[LanguageBackend]] = {
+        'python': PythonBackend,
+        'go': GoBackend,
+    }
 
-    # add source dir to paths so that the module doesn't need to be installed to be worked on
-    if args.add_to_pythonpath:
-        add_to_pythonpath(args.src_base_dir)
+    backend = backend_map[args.language](args)
+
+    try:
+        backend.prepare_environment()
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
 
     if args.prompt_for_tests:
         try:
@@ -686,29 +621,36 @@ def main():
             print("Continuing from checkpoint;  coverage: ", end='', flush=True)
             coverage = state.get_initial_coverage()
         else:
-            if args.disable_polluting or args.disable_failing:
-                # check and clean up suite before measuring coverage
-                check_whole_suite(args)
-
-            try:
-                print("Measuring coverage...  ", end='', flush=True)
-                coverage = measure_suite_coverage(tests_dir=args.tests_dir, source_dir=args.package_dir,
-                                                  pytest_args=args.pytest_args,
-                                                  isolate_tests=args.isolate_tests,
-                                                  branch_coverage=args.branch_coverage,
-                                                  trace=(print if args.debug else None))
+            if args.skip_suite_measurement:
+                print("Skipping initial coverage measurement; using synthetic zero coverage.")
+                coverage = backend.initial_empty_coverage()
                 state = State(coverage)
+            else:
+                if args.language == 'python' and (args.disable_polluting or args.disable_failing):
+                    # check and clean up suite before measuring coverage
+                    check_whole_suite(args)
 
-            except subprocess.CalledProcessError as e:
-                print("Error measuring coverage:\n" + str(e.stdout, 'UTF-8', errors='ignore'))
-                return 1
+                try:
+                    print("Measuring coverage...  ", end='', flush=True)
+                    coverage = backend.measure_suite_coverage(
+                        pytest_args=args.pytest_args,
+                        isolate_tests=args.isolate_tests,
+                        branch_coverage=args.branch_coverage,
+                        trace=(print if args.debug else None),
+                        raise_on_failure=not args.continue_on_failure,
+                    )
+                    state = State(coverage)
+
+                except subprocess.CalledProcessError as e:
+                    print("Error measuring coverage:\n" + str(e.stdout, 'UTF-8', errors='ignore'))
+                    return 1
 
         print(summary_coverage(coverage, args.source_files))
         # TODO also show running coverage estimate
 
         chatter.set_add_cost(state.add_cost)
 
-        segments = sorted(get_missing_coverage(state.get_initial_coverage(), line_limit=args.line_limit),
+        segments = sorted(backend.get_missing_coverage(state.get_initial_coverage(), line_limit=args.line_limit),
                           key=lambda seg: seg.missing_count(), reverse=True)
 
         # save initial coverage so we don't have to redo it next time
@@ -721,7 +663,7 @@ def main():
         print("(in the following, G=good, F=failed, U=useless and R=retry)")
 
         async def work_segment(seg: CodeSegment) -> None:
-            if await improve_coverage(args, chatter, prompter, seg):
+            if await improve_coverage(args, backend, chatter, prompter, seg):
                 # Only mark done if was able to complete (True return),
                 # so that it can be retried after installing any missing modules
                 state.mark_done(seg)
@@ -771,19 +713,21 @@ def main():
 
     # --- (3) clean up resulting test suite ---
 
-    if args.disable_polluting or args.disable_failing:
+    if args.language == 'python' and (args.disable_polluting or args.disable_failing):
         check_whole_suite(args)
 
     # --- (4) show final coverage
 
-    if args.prompt_for_tests:
+    if args.prompt_for_tests and not args.skip_suite_measurement:
         try:
             print("Measuring coverage...  ", end='', flush=True)
-            coverage = measure_suite_coverage(tests_dir=args.tests_dir, source_dir=args.package_dir,
-                                              pytest_args=args.pytest_args,
-                                              isolate_tests=args.isolate_tests,
-                                              branch_coverage=args.branch_coverage,
-                                              trace=(print if args.debug else None))
+            coverage = backend.measure_suite_coverage(
+                pytest_args=args.pytest_args,
+                isolate_tests=args.isolate_tests,
+                branch_coverage=args.branch_coverage,
+                trace=(print if args.debug else None),
+                raise_on_failure=not args.continue_on_failure,
+            )
 
         except subprocess.CalledProcessError as e:
             print("Error measuring coverage:\n" + str(e.stdout, 'UTF-8', errors='ignore'))
@@ -803,5 +747,7 @@ def main():
                 with args.write_requirements_to.open("a") as f:
                     for module in required:
                         f.write(f"{module}\n")
+    elif args.prompt_for_tests and args.skip_suite_measurement:
+        print("Skipping final coverage measurement due to --skip-suite-measurement.")
 
     return 0
