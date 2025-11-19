@@ -1,3 +1,9 @@
 .hypothesis
 __pycache__
 *.swp
+tests/
+tests-click/
+coverup-log
+slipcove*
+.venv/
+.pytest_cache/
