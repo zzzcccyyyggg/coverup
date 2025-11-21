@@ -88,6 +88,16 @@ class GoBackend(LanguageBackend):
                     raise subprocess.CalledProcessError(
                         run.returncode, cmd, output=run.stdout.encode()
                     )
+                # If we are continuing on failure, we still try to parse the coverage profile
+                # below, as go test often produces it even if some tests fail.
+
+            if profile_path.exists() and profile_path.stat().st_size > 0:
+                coverage = parse_go_cover_profile(
+                    profile_path,
+                    module_root=self.module_root,
+                    module_path=self._module_path,
+                )
+            else:
                 coverage = {
                     "files": {},
                     "meta": {"branch_coverage": False},
@@ -99,12 +109,6 @@ class GoBackend(LanguageBackend):
                         "percent_covered": 0.0,
                     },
                 }
-            else:
-                coverage = parse_go_cover_profile(
-                    profile_path,
-                    module_root=self.module_root,
-                    module_path=self._module_path,
-                )
         finally:
             profile_path.unlink(missing_ok=True)
 
@@ -129,6 +133,7 @@ class GoBackend(LanguageBackend):
         header = self._make_header(segment, asked=None, gained=None, include_comments=False)
         prepared_code = self._prepare_test_code(test_code, segment)
         prepared_code = self._ensure_unique_test_names(package_dir, prepared_code)
+        self._enforce_test_size(prepared_code, log_write)
         temp_path.write_text(header + prepared_code)
         formatted_ok = self._format_with_goimports(temp_path, log_write)
 
@@ -159,9 +164,24 @@ class GoBackend(LanguageBackend):
         stdout, _ = await process.communicate()
         output = stdout.decode("utf-8", errors="ignore")
         if log_write:
-            log_write(output)
+            self._log_block(
+                log_write,
+                "[coverup] go test stdout/stderr",
+                output,
+            )
 
         if process.returncode != 0:
+            # Attempt to fix missing dependencies if that was the error
+            if "no required module provides package" in output or "cannot find package" in output:
+                if log_write:
+                    log_write("[coverup] detected missing dependencies, attempting 'go mod tidy'...\n")
+                self._run_go_mod_tidy(log_write)
+                # We could retry the test here, but for now let's just let the error propagate
+                # and rely on the next attempt or the user to re-run.
+                # Actually, if we fixed it, we should probably retry immediately?
+                # But the architecture here is simple, let's just tidy and fail,
+                # so the next attempt (retry) might succeed.
+
             profile_path.unlink(missing_ok=True)
             generated_code: str | None = None
             if temp_path.exists():
@@ -179,14 +199,21 @@ class GoBackend(LanguageBackend):
                 )
 
             if log_write and generated_code is not None:
-                log_write(
-                    "\n---- BEGIN generated test ----\n"
-                    + generated_code
-                    + "\n---- END generated test ----\n"
+                self._log_block(
+                    log_write,
+                    "---- BEGIN generated test ----",
+                    generated_code,
+                    limit=16000,
                 )
+                log_write("\n---- END generated test ----\n")
 
             temp_path.unlink(missing_ok=True)
-            raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout)
+            summary = self._summarize_go_test_failure(output)
+            summary_line = summary or "go test failed; check the log above for details."
+            message = f"{summary_line}\n(Full go test output truncated in log.)\n"
+            raise subprocess.CalledProcessError(
+                process.returncode, cmd, output=message.encode()
+            )
 
         temp_path.unlink(missing_ok=True)
 
@@ -527,9 +554,10 @@ class GoBackend(LanguageBackend):
             return False
 
         if result.returncode != 0 and log_write:
-            log_write(
-                f"[coverup] {formatter_cmd[0]} exited with {result.returncode}:\n"
-                + result.stdout
+            self._log_block(
+                log_write,
+                f"[coverup] {formatter_cmd[0]} exited with {result.returncode}:",
+                result.stdout,
             )
 
         return result.returncode == 0
@@ -583,6 +611,80 @@ class GoBackend(LanguageBackend):
         if trailing_newline and not result.endswith("\n"):
             result += "\n"
         return result
+
+    def _run_go_mod_tidy(self, log_write: T.Callable[[str], None] | None) -> None:
+        cmd = [self._go_cmd, "mod", "tidy"]
+        try:
+            subprocess.run(
+                cmd,
+                cwd=self.module_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=True,
+                text=True
+            )
+            if log_write:
+                log_write("[coverup] 'go mod tidy' completed successfully.\n")
+        except subprocess.CalledProcessError as e:
+            if log_write:
+                log_write(f"[coverup] 'go mod tidy' failed:\n{e.stdout}\n")
+
+    def _enforce_test_size(
+        self,
+        code: str,
+        log_write: T.Callable[[str], None] | None,
+        *,
+        max_lines: int = 400,
+        max_chars: int = 20000,
+    ) -> None:
+        line_count = code.count("\n") + 1
+        char_count = len(code)
+        if line_count <= max_lines and char_count <= max_chars:
+            return
+
+        msg = (
+            f"[coverup] generated test has {line_count} lines / {char_count} chars, "
+            f"which exceeds the limit ({max_lines} lines / {max_chars} chars)."
+            " Trim the test scope or split cases before retrying."
+        )
+        if log_write:
+            log_write(msg + "\n")
+        raise RuntimeError(msg)
+
+    def _log_block(
+        self,
+        log_write: T.Callable[[str], None] | None,
+        header: str,
+        text: str,
+        *,
+        limit: int = 8000,
+    ) -> None:
+        if log_write is None or not text:
+            return
+
+        clean_header = header.rstrip()
+        if len(text) <= limit:
+            log_write(f"{clean_header}\n{text}\n")
+            return
+
+        head = limit // 2
+        tail = limit - head
+        truncated_msg = (
+            f"{clean_header} (truncated to {limit} chars)\n"
+            f"{text[:head]}\n... (omitted) ...\n{text[-tail:]}\n"
+        )
+        log_write(truncated_msg)
+
+    def _summarize_go_test_failure(self, output: str) -> str:
+        lines = output.splitlines()
+        preferred = next((ln for ln in lines if ".go:" in ln), None)
+        if preferred:
+            return preferred.strip()
+        for line in lines:
+            stripped = line.strip()
+            if stripped:
+                return stripped
+        return ""
 
 
 def parse_go_cover_profile(

@@ -7,3 +7,7 @@ coverup-log
 slipcove*
 .venv/
 .pytest_cache/
+src/click/
+src/cobra/
+src/flask/
+src/validator/

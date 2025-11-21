@@ -9,6 +9,7 @@ class GoGptV1Prompter(Prompter):
 
     def initial_prompt(self, segment) -> T.List[dict]:
         filename = segment.path.relative_to(self.args.src_base_dir)
+        path_str = str(filename)
         missing_desc = lines_branches_do(segment.missing_lines, set(), segment.missing_branches)
 
         extra_guidance = self._extra_guidance(filename)
@@ -20,25 +21,85 @@ class GoGptV1Prompter(Prompter):
     - Do NOT redefine or reimplement existing types, methods, functions, constants, or unexported structs/fields from the production code.
     - Only emit test functions plus lightweight helpers with unique names that exist purely to support those tests.
     - Call the real exported APIs; do not copy production logic, and do not call global entry points like `Execute()` or `cobra.OnInitialize`.
-    - Clean up any filesystem or environment changes your test makes.
+    - Clean up any filesystem or environment changes your test makes (use `t.Cleanup(func() { ... })`) and mark shared helpers with `t.Helper()`.
+    - Prefer table-driven tests (`tests := []struct { ... }`) for covering multiple cases efficiently, but keep each test focused on 1-3 closely related tags/branches.
     """
+
+        example_texts = [
+            """
+    Example of desired output style:
+    ```go
+    package mypkg
+
+    import (
+        "testing"
+    )
+
+    func TestCalculate_CoverUp(t *testing.T) {
+        tests := []struct{
+            name    string
+            input   int
+            want    int
+            wantErr bool
+        }{
+            {"positive", 10, 20, false},
+            {"negative", -1, 0, true},
+        }
+
+        for _, tt := range tests {
+            t.Run(tt.name, func(t *testing.T) {
+                got, err := Calculate(tt.input)
+                if (err != nil) != tt.wantErr {
+                    t.Errorf("Calculate() error = %v, wantErr %v", err, tt.wantErr)
+                    return
+                }
+                if got != tt.want {
+                    t.Errorf("Calculate() = %v, want %v", got, tt.want)
+                }
+            })
+        }
+    }
+    ```
+    """
+        ]
+
+        example_text = "\n".join(example_texts)
 
         if extra_guidance:
             constraint_text += "\nAdditional guidance specific to this file:\n" + extra_guidance
 
+        excerpt, note = self._excerpt_with_limit(segment)
+        note_text = f"\n{note}\n" if note else ""
+
+        context_block = f"""Context:
+    - File: {filename}
+    - Missing coverage: {missing_desc}
+    """
+
+        task_block = """Task:
+    - Write `_test.go` code that exercises the uncovered paths using Go's `testing` package.
+    - Keep the tests hermetic: no network, disk, or global CLI side effects unless guarded by `t.Cleanup`.
+    - Prefer clear assertions over logging, and fail fast when expectations are not met.
+    """
+
+        excerpt_block = f"""Code excerpt (may be truncated):
+    ```go
+    {excerpt}
+    ```
+    """
+
         return [
             mk_message(
-                f"""
-You are an experienced Go engineer writing targeted `_test.go` files.
-The following Go code, taken from {filename}, lacks coverage: {missing_desc}.
-Write Go unit tests that execute the missing lines, using the standard `testing` package.
-Ensure tests compile without external dependencies, include assertions, and clean up any filesystem or environment state.
-{constraint_text}
-Respond only with Go code enclosed in triple backticks.
-```go
-{segment.get_excerpt()}
-```
-"""
+            f"""
+    You are an experienced Go engineer writing targeted `_test.go` files.
+    {context_block}
+    {task_block}
+    {constraint_text}
+    {example_text}
+    Respond only with Go code enclosed in triple backticks (no prose).
+    {excerpt_block}
+    {note_text}
+    """
             )
         ]
 
@@ -53,9 +114,9 @@ Respond only with Go code enclosed in triple backticks.
                 f"""
 The generated Go tests failed:
 {error}
-    Focus on the first compiler/runtime error, fix it, and regenerate a complete test file.
-    Make sure the package name, imports, helper names, and use of exported APIs follow the constraints (no unexported struct literals, no missing imports, no `package main`).
-    Respond only with complete Go source enclosed in ```go blocks.
+    - Fix the first compiler/runtime error shown above, then ensure the regenerated file builds cleanly.
+    - Keep the package clause, imports, helper names, and API usage aligned with the production file (no `package main`, no unused imports, no unexported struct literals).
+    - Return a full replacement `_test.go` file enclosed in ```go fences; partial snippets will be discarded.
 {guidance_text}
 """
             )
@@ -72,7 +133,8 @@ The generated Go tests failed:
             mk_message(
                 f"""
 Previous tests compiled but coverage gaps remain: {desc}.
-    Revise or add Go tests that cover the missing behavior while still following the constraints (correct package, complete imports, only unique helpers, no unexported struct access, no Execute calls). Respond only with complete Go code in ```go fences.
+    - Keep the working tests and add/adjust cases until the specific lines/branches above execute while respecting the constraints (correct package, complete imports, unique helpers, no Execute calls).
+    - Return the entire updated `_test.go` file inside ```go fences.
 {guidance_text}
 """
             )
@@ -106,3 +168,28 @@ Previous tests compiled but coverage gaps remain: {desc}.
             )
 
         return "\n".join(hints)
+
+    def _excerpt_with_limit(self, segment, max_lines: int = 200, max_chars: int = 12000) -> T.Tuple[str, str]:
+        """Return a possibly truncated excerpt plus a note describing any truncation."""
+        raw = segment.get_excerpt()
+        note = ""
+
+        lines = raw.splitlines()
+        truncated = False
+
+        if len(lines) > max_lines:
+            head = max_lines // 2
+            tail = max_lines - head
+            lines = lines[:head] + ["          … (excerpt truncated) …"] + lines[-tail:]
+            truncated = True
+
+        excerpt = "\n".join(lines)
+
+        if len(excerpt) > max_chars:
+            excerpt = excerpt[:max_chars] + "\n          … (excerpt truncated for length)"
+            truncated = True
+
+        if truncated:
+            note = "(Code excerpt truncated to keep the prompt size manageable; focus on the annotated lines above.)"
+
+        return excerpt, note
