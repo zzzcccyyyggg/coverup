@@ -15,10 +15,15 @@ from ..python_support import (
 )
 
 from .base import LanguageBackend
+from ..diagnostic_ir import (
+    DiagnosticIR, DiagnosticIRBuilder, ErrorCategory, Phase,
+)
 
 
 class PythonBackend(LanguageBackend):
     """Backend implementation targeting Python projects."""
+
+    language_id = "python"
 
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
@@ -120,6 +125,40 @@ class PythonBackend(LanguageBackend):
         line_limit: int,
     ) -> T.List[CodeSegment]:
         return get_missing_coverage(coverage, line_limit=line_limit)
+
+    def classify_error(self, output: str, phase: str = "run") -> DiagnosticIR:
+        """Classify a Python test error into DiagnosticIR."""
+        formatted = self.format_test_error(output)
+        cat, code = self._classify_python_error(output)
+        return (
+            DiagnosticIRBuilder(language="python", phase=phase)
+            .fail()
+            .tool("pytest")
+            .error(cat, code, formatted)
+            .build()
+        )
+
+    @staticmethod
+    def _classify_python_error(output: str) -> tuple:
+        text = output.lower()
+        if "importerror" in text or "modulenotfounderror" in text or "no module named" in text:
+            return ErrorCategory.IMPORT.value, ""
+        if "typeerror" in text:
+            return ErrorCategory.TYPE.value, ""
+        if "attributeerror" in text:
+            return ErrorCategory.VISIBILITY.value, ""
+        if "syntaxerror" in text:
+            return ErrorCategory.SYNTAX.value, ""
+        if "assertionerror" in text:
+            return ErrorCategory.ASSERTION.value, ""
+        if "nameerror" in text:
+            return ErrorCategory.IMPORT.value, ""
+        if "timeout" in text:
+            return ErrorCategory.TIMEOUT.value, ""
+        return ErrorCategory.UNKNOWN.value, ""
+
+    def _default_tool_name(self) -> str:
+        return "pytest"
 
     def format_test_error(self, output: str) -> str:
         return clean_error(output)

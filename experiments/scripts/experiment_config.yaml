@@ -1,0 +1,120 @@
+# CoverAgent-ML Experiment Configuration
+# ========================================
+# 9 projects × 3 seeds × 5 variants = 135 runs
+
+# LLM settings
+llm:
+  model: "deepseek/deepseek-coder"
+  api_key_env: "DEEPSEEK_API_KEY"
+  temperature: 0
+  max_concurrency: 5
+  max_attempts: 5
+
+# Seeds for reproducibility
+seeds: [42, 123, 456]
+
+# Ablation variants
+variants:
+  full:         # Full CoverAgent-ML
+    description: "DiagnosticIR + Memory + Repair + Planner"
+    flags: []   # all agent features enabled by default
+  no_memory:
+    description: "Ablation: disable ReflectiveMemory"
+    flags: ["--no-agent-memory"]
+  no_repair:
+    description: "Ablation: disable tool-first repair"
+    flags: ["--no-agent-repair"]
+  no_planner:
+    description: "Ablation: disable UCB planner (use round-robin)"
+    flags: ["--no-agent-planner"]
+  baseline:
+    description: "Vanilla CoverUp (no agent features)"
+    flags: ["--no-agent-memory", "--no-agent-repair", "--no-agent-planner"]
+
+# Benchmark projects  
+projects:
+  # --- Rust (3 projects) ---
+  - name: similar
+    language: rust
+    repo: "https://github.com/mitsuhiko/similar.git"
+    tag: "2.7.0"
+    source_dir: "src"
+    prompt: "gpt-rust-v1"
+    notes: "Diff library, ~2k LOC, many algorithms"
+    
+  - name: semver
+    language: rust
+    repo: "https://github.com/dtolnay/semver.git"
+    tag: "1.0.23"
+    source_dir: "src"
+    prompt: "gpt-rust-v1"
+    notes: "Semver parsing, ~1.5k LOC"
+
+  - name: strsim-rs
+    language: rust
+    repo: "https://github.com/rapidfuzz/strsim-rs.git"
+    tag: "0.11.1"
+    source_dir: "src"
+    prompt: "gpt-rust-v1"
+    notes: "String similarity, ~500 LOC"
+
+  # --- Python (3 projects) ---
+  - name: flask
+    language: python
+    repo: "https://github.com/pallets/flask.git"
+    tag: "3.1.0"
+    source_dir: "src/flask"
+    prompt: "gpt-v2"
+    notes: "Web framework, CoverUp's original benchmark"
+    
+  - name: click
+    language: python
+    repo: "https://github.com/pallets/click.git"
+    tag: "8.1.7"
+    source_dir: "src/click"
+    prompt: "gpt-v2"
+    notes: "CLI framework, another CoverUp benchmark"
+
+  - name: pydantic-core
+    language: python
+    repo: "https://github.com/pydantic/pydantic.git"  
+    tag: "v2.9.0"
+    source_dir: "pydantic"
+    prompt: "gpt-v2"
+    notes: "Data validation, complex type system"
+
+  # --- Go (3 projects) ---
+  - name: cobra
+    language: go
+    repo: "https://github.com/spf13/cobra.git"
+    tag: "v1.8.1"
+    source_dir: "."
+    prompt: "gpt-go-v1"
+    notes: "CLI framework, Go standard"
+
+  - name: logrus
+    language: go
+    repo: "https://github.com/sirupsen/logrus.git"
+    tag: "v1.9.3"
+    source_dir: "."
+    prompt: "gpt-go-v1"
+    notes: "Logging library, widely used"
+
+  - name: gjson
+    language: go
+    repo: "https://github.com/tidwall/gjson.git"
+    tag: "v1.18.0"
+    source_dir: "."
+    prompt: "gpt-go-v1"
+    notes: "JSON parser, parser algorithms"
+
+# Output settings
+output:
+  results_dir: "experiments/results"
+  logs_dir: "experiments/logs"
+  summary_file: "experiments/summary.csv"
+
+# Timeouts
+timeouts:
+  per_project_seconds: 3600   # 1 hour max per run
+  total_seconds: 86400        # 24 hours max total

@@ -104,6 +104,36 @@ As the graph shows, CoverUp achieves higher coverage than CodaMosa for most modu
 
 <br/>
 
+## Go Language Support
+
+CoverUp now supports generating tests for **Go** projects. The Go backend provides:
+
+- **Static analysis** via tree-sitter: symbol lookup (`get_info`), branch inference, receiver context extraction
+- **Branch coverage guidance**: infers logical branches from `if/else`, `switch/case`, `select` and feeds them into prompts
+- **Dynamic prompt hints**: automatically detects patterns (interface, error handling, goroutine, context, file I/O, etc.) and adds Go-specific testing guidance
+- **LLM tool function**: exposes `get_info` so the LLM can query Go type definitions, function signatures and methods during generation
+
+### Using CoverUp for Go
+
+```shell
+$ coverup --language go --package-dir /path/to/your/go/module --model gpt-4o
+```
+
+Example with the [Cobra](https://github.com/spf13/cobra) CLI framework:
+```shell
+$ coverup --language go --package-dir src/cobra --model gpt-4o --prompt gpt-go-v1
+```
+
+### Go Requirements
+- Go 1.20+ installed and in PATH
+- Python 3.10+ with `tree-sitter` and `tree-sitter-languages` packages
+- LLM API key (same as Python usage)
+
+For detailed testing instructions, see [docs/testing-guide.md](docs/testing-guide.md).
+For technical details on Go support improvements, see [docs/go_generation_updates.md](docs/go_generation_updates.md).
+
+<br/>
+
 ## Work In Progress
 
 This is an early release of CoverUp.

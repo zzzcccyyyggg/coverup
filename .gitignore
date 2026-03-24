@@ -1,13 +1,64 @@
-.hypothesis
-__pycache__
-*.swp
+# ============================================
+# CoverUp .gitignore
+# ============================================
+
+# ---------- Python 通用 ----------
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+*.whl
+
+# ---------- 虚拟环境 ----------
+.venv/
+venv/
+env/
+
+# ---------- 测试 & 覆盖率 ----------
+.hypothesis/
+.pytest_cache/
+.coverage
+htmlcov/
 tests/
 tests-click/
+
+# ---------- IDE & 编辑器 ----------
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ---------- 日志文件 ----------
 coverup-log
-slipcove*
-.venv/
-.pytest_cache/
+coverup-debug-log
+*.log
+
+# ---------- 实验输出 ----------
+experiments/results/
+experiments/logs/
+experiments/summary.csv
+
+# ---------- 外部基准项目（子模块/克隆） ----------
 src/click/
 src/cobra/
 src/flask/
 src/validator/
+
+# ---------- 构建产物 ----------
+UNKNOWN.egg-info/
+src/CoverUp.egg-info/
+src/src.zip
+
+# ---------- 覆盖率基线快照 ----------
+slipcover*.json
+
+# ---------- 系统 & 杂项 ----------
+.DS_Store
+Thumbs.db
+.argusbot/
+.env
