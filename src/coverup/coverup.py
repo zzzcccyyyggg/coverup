@@ -3,6 +3,7 @@ import json
 
 import argparse
 import os
+import random
 import subprocess
 import sys
 import typing as T
@@ -14,37 +15,52 @@ from . import llm
 from .languages.base import LanguageBackend
 from .languages.go_backend import GoBackend
 from .languages.python_backend import PythonBackend
+from .languages.rust_backend import RustBackend
 from .segment import CodeSegment
 from .prompt.prompter import Prompter
 from .version import __version__
 from .utils import format_branches, summary_coverage
 from .python_support import get_required_modules
+from .diagnostic_ir import DiagnosticIR, DiagnosticIRBuilder, Phase
+from .agents.memory import ReflectiveMemory, SuccessLevel
+from .agents.repair import RepairOrchestrator
+from .agents.planner import UCBPlanner
+from .agents.trace import TraceLogger
+from .agents.blocker import extract_blockers, format_blockers_for_prompt
 
 
 def get_prompters() -> dict[str, T.Callable[[T.Any], Prompter]]:
-    # in the future, we may dynamically load based on file names.
-
     from .prompt.gpt_v1 import GptV1Prompter
     from .prompt.gpt_v2 import GptV2Prompter
-    from .prompt.gpt_v2_ablated import GptV2AblatedPrompter
-    from .prompt.claude import ClaudePrompter
     from .prompt.gpt_go_v1 import GoGptV1Prompter
+    from .prompt.gpt_rust_v1 import RustGptV1Prompter
+
+    def baseline_factory(cmd_args):
+        if cmd_args.language == "python":
+            return GptV1Prompter(cmd_args)
+        if cmd_args.language == "go":
+            return GoGptV1Prompter(cmd_args)
+        if cmd_args.language == "rust":
+            return RustGptV1Prompter(cmd_args)
+        return GptV1Prompter(cmd_args)
+
+    def advanced_factory(cmd_args):
+        if cmd_args.language == "python":
+            return GptV2Prompter(cmd_args)
+        if cmd_args.language == "go":
+            return GoGptV1Prompter(cmd_args)
+        if cmd_args.language == "rust":
+            return RustGptV1Prompter(cmd_args)
+        return GptV2Prompter(cmd_args)
 
     return {
-        "gpt-v1": GptV1Prompter,
-        "gpt-v2": GptV2Prompter,
-        "gpt-v2-no-coverage": lambda cmd_args: GptV2AblatedPrompter(cmd_args, with_coverage=False),
-        "gpt-v2-no-code-context": lambda cmd_args: GptV2AblatedPrompter(cmd_args, with_get_info=False, with_imports=False),
-        "gpt-v2-no-error-fixing": lambda cmd_args: GptV2AblatedPrompter(cmd_args, with_error_fixing=False),
-        "gpt-v2-ablated": \
-            lambda cmd_args: GptV2AblatedPrompter(cmd_args,
-                with_coverage=False, with_get_info=False, with_imports=False, with_error_fixing=False),
-        "claude": ClaudePrompter,
-        "gpt-go-v1": GoGptV1Prompter,
+        "baseline": baseline_factory,
+        "advanced": advanced_factory,
     }
 
 
 prompter_registry = get_prompters()
+MAX_TOOL_REPAIR_PASSES = 3
 
 
 def parse_args(args=None):
@@ -66,7 +82,7 @@ def parse_args(args=None):
                     help='directory with the package sources (e.g., src/flask)')
     g.add_argument('--source-dir', type=Path_existing_dir, dest='package_dir', help=argparse.SUPPRESS)
 
-    ap.add_argument('--language', type=str, choices=['python', 'go'], default='python',
+    ap.add_argument('--language', type=str, choices=['python', 'go', 'rust'], default='python',
                     help='target language for coverage improvement')
 
     ap.add_argument('--checkpoint', type=Path, 
@@ -87,7 +103,7 @@ def parse_args(args=None):
 
     ap.add_argument('--prompt', '--prompt-family', type=str,
                     choices=list(prompter_registry.keys()),
-                    default='gpt-v2',
+                    default='advanced',
                     help='Prompt style to use')
 
     ap.add_argument('--ollama-api-base', type=str, default="http://localhost:11434",
@@ -102,6 +118,15 @@ def parse_args(args=None):
     ap.add_argument('--line-limit', type=int, default=50,
                     help='attempt to keep code segment(s) at or below this limit')
 
+    ap.add_argument('--focus-file', dest='focus_files', action='append', default=[],
+                    help='only process segments whose source path matches this suffix or substring; repeatable')
+    ap.add_argument('--focus-segment', dest='focus_segments', action='append', default=[],
+                    help='only process segments whose identifier (e.g. src/foo.rs:10-20) matches this suffix or substring; repeatable')
+    ap.add_argument('--focus-name', dest='focus_names', action='append', default=[],
+                    help='only process segments whose function/class name contains this substring; repeatable')
+    ap.add_argument('--max-segments', type=int, default=None,
+                    help='after any focus filters, keep only the top-N segments by missing coverage')
+
     ap.add_argument('--rate-limit', type=int,
                     help='max. tokens/minute to send in prompts')
 
@@ -110,6 +135,9 @@ def parse_args(args=None):
 
     ap.add_argument('--max-backoff', type=int, default=64,
                     help='max. number of seconds for backoff interval')
+
+    ap.add_argument('--seed', type=int, default=None,
+                    help='seed for Python-level randomness and experiment bookkeeping')
 
     ap.add_argument('--dry-run', default=False,
                     action=argparse.BooleanOptionalAction,
@@ -182,11 +210,30 @@ def parse_args(args=None):
         if ivalue < 0: raise argparse.ArgumentTypeError("must be a number >= 0")
         return ivalue
 
-    ap.add_argument('--max-concurrency', type=positive_int, default=50,
+    ap.add_argument('--max-concurrency', type=positive_int, default=15,
                     help='maximum number of parallel requests; 0 means unlimited')
 
     ap.add_argument('--save-coverage-to', type=Path_existing_dir,
                     help='save each new test\'s coverage to given directory')
+
+    # ── CoverAgent-ML ablation flags ──
+    ap.add_argument('--no-agent-memory', default=False,
+                    action='store_true',
+                    help='disable ReflectiveMemory (ablation)')
+    ap.add_argument('--no-agent-repair', default=False,
+                    action='store_true',
+                    help='disable tool-first RepairOrchestrator (ablation)')
+    ap.add_argument('--no-agent-planner', default=False,
+                    action='store_true',
+                    help='disable UCB Planner (ablation)')
+    ap.add_argument('--no-agent-blocker', default=False,
+                    action='store_true',
+                    help='disable Coverage Blocker Explanation (ablation)')
+    ap.add_argument('--semantic-recovery', default=True,
+                    action=argparse.BooleanOptionalAction,
+                    help='enable semantic recovery guidance after repeated stalled retries')
+    ap.add_argument('--trace-log', type=str, default=None,
+                    help='path for JSONL trace log (enables TraceLogger)')
 
     ap.add_argument('--version', action='version',
                     version=f"%(prog)s v{__version__} (Python {'.'.join(map(str, sys.version_info[:3]))})")
@@ -248,15 +295,30 @@ def parse_args(args=None):
 
         args.src_base_dir = args.package_dir
         args.tests_dir = args.package_dir
-        args.branch_coverage = False
+        # Branch coverage is now inferred via control-flow analysis in go_codeinfo
+        args.branch_coverage = True
         args.install_missing_modules = False
         args.add_to_pythonpath = False
 
         if args.disable_polluting or args.disable_failing:
             ap.error('Go backend does not support --disable-polluting or --disable-failing yet.')
 
-        if args.prompt == 'gpt-v2' and '--prompt' not in sys.argv:
-            args.prompt = 'gpt-go-v1'
+    elif args.language == 'rust':
+        if args.source_files:
+            ap.error('Specifying individual source files is not supported for Rust projects; use --package-dir.')
+
+        if not args.package_dir:
+            ap.error('Rust support requires --package-dir pointing to the crate root (containing Cargo.toml).')
+
+        args.src_base_dir = args.package_dir
+        args.tests_dir = args.package_dir
+        args.branch_coverage = True
+        args.install_missing_modules = False
+        args.add_to_pythonpath = False
+
+        if args.disable_polluting or args.disable_failing:
+            ap.error('Rust backend does not support --disable-polluting or --disable-failing yet.')
+
 
     else:
         ap.error(f'Unsupported language "{args.language}"')
@@ -279,6 +341,46 @@ def log_write(args: argparse.Namespace, seg: CodeSegment, m: str) -> None:
         log_file = open(args.log_file, "a", buffering=1)    # 1 = line buffered
 
     log_file.write(f"---- {datetime.now().isoformat(timespec='seconds')} {seg} ----\n{m}\n")
+
+
+def _normalize_match_text(value: T.Any) -> str:
+    return str(value).replace("\\", "/")
+
+
+def _matches_pattern(pattern: str, target: str) -> bool:
+    patt = _normalize_match_text(pattern)
+    text = _normalize_match_text(target)
+    return patt == text or text.endswith(patt) or patt in text
+
+
+def _segment_matches_focus_filters(args: argparse.Namespace, seg: CodeSegment) -> bool:
+    seg_id = _normalize_match_text(seg.identify())
+    seg_path = _normalize_match_text(seg.path)
+    seg_file = _normalize_match_text(seg.filename)
+    seg_name = (seg.name or "").lower()
+
+    if args.focus_files:
+        if not any(
+            _matches_pattern(patt, seg_path) or _matches_pattern(patt, seg_file)
+            for patt in args.focus_files
+        ):
+            return False
+
+    if args.focus_segments:
+        if not any(_matches_pattern(patt, seg_id) for patt in args.focus_segments):
+            return False
+
+    if args.focus_names:
+        if not any(patt.lower() in seg_name for patt in args.focus_names):
+            return False
+
+    return True
+
+
+def _filters_active(args: argparse.Namespace) -> bool:
+    return bool(
+        args.focus_files or args.focus_segments or args.focus_names or args.max_segments
+    )
 
 
 def check_whole_suite(args: argparse.Namespace) -> None:
@@ -397,6 +499,12 @@ class State:
         if self._bar:
             self._bar.update_cost(self._cost)
 
+    def get_cost(self) -> float:
+        return self._cost
+
+    def get_counters(self) -> dict[str, int]:
+        return dict(self._counters)
+
 
     def inc_counter(self, key: str):
         """Increments a progress counter."""
@@ -462,7 +570,48 @@ def extract_python(response: str) -> str:
     return m.group(1)
 
 
+# ── CoverAgent-ML shared instances ──────────────────────────────────────
+
 state: State
+memory: T.Optional[ReflectiveMemory] = None
+repair_orchestrator: T.Optional[RepairOrchestrator] = None
+planner: T.Optional[UCBPlanner] = None
+trace_logger: T.Optional[TraceLogger] = None
+use_blocker: bool = True
+
+
+def _ensure_retry_context(seg: CodeSegment) -> dict[str, T.Any]:
+    ctx = getattr(seg, "_retry_context", None)
+    if ctx is None:
+        ctx = {"history": []}
+        seg._retry_context = ctx  # type: ignore[attr-defined]
+    return ctx
+
+
+def _record_retry_event(
+    seg: CodeSegment,
+    *,
+    attempt: int,
+    outcome: str,
+    ir: DiagnosticIR,
+) -> None:
+    ctx = _ensure_retry_context(seg)
+    history = ctx.setdefault("history", [])
+    history.append({
+        "attempt": attempt,
+        "outcome": outcome,
+        "phase": ir.phase,
+        "category": ir.error_category,
+        "code": ir.error_code,
+        "message": ir.message[:240],
+    })
+    if len(history) > 10:
+        del history[:-10]
+
+    seg._attempt_count = attempt  # type: ignore[attr-defined]
+    seg._current_ir = ir  # type: ignore[attr-defined]
+    seg._last_outcome = outcome  # type: ignore[attr-defined]
+
 
 async def improve_coverage(
     args: argparse.Namespace,
@@ -471,10 +620,55 @@ async def improve_coverage(
     prompter: Prompter,
     seg: CodeSegment
 ) -> bool:
-    """Works to improve coverage for a code segment."""
+    """Works to improve coverage for a code segment.
+
+    CoverAgent-ML enhanced loop:
+    1. Inject reflective memory lessons into initial prompt
+    2. On compile/run failure → classify into DiagnosticIR
+    3. Try tool-first repair *before* falling back to LLM
+    4. Record failure in reflective memory
+    5. Update UCB planner with reward signal
+    """
+    global memory, repair_orchestrator, planner, trace_logger, use_blocker
+
+    seg._retry_context = {"history": []}  # type: ignore[attr-defined]
+    seg._attempt_count = 0  # type: ignore[attr-defined]
+    seg._current_ir = None  # type: ignore[attr-defined]
+    seg._last_outcome = ""  # type: ignore[attr-defined]
+    seg._latest_blockers = []  # type: ignore[attr-defined]
 
     messages = prompter.initial_prompt(seg)
+
+    # ── Inject coverage blocker analysis into the conversation ──
+    initial_blocker_injected = False
+    if use_blocker:
+        try:
+            blockers = extract_blockers(
+                seg.path, seg.missing_lines, seg.missing_branches,
+                seg.executed_lines, backend.language_id,
+            )
+            seg._latest_blockers = blockers  # type: ignore[attr-defined]
+            blocker_text = format_blockers_for_prompt(blockers)
+            if blocker_text:
+                initial_blocker_injected = True
+                from .prompt.prompter import mk_message
+                messages.append(mk_message(blocker_text, role="user"))
+                log_write(args, seg, f"[BLOCKER] Injected {len(blockers)} blocker(s)")
+        except Exception as e:
+            log_write(args, seg, f"[BLOCKER] Extraction failed: {e}")
+
+    # ── Inject memory lessons into the conversation ──
+    initial_memory_injected = False
+    if memory:
+        lessons = memory.format_for_prompt(backend.language_id)
+        if lessons:
+            initial_memory_injected = True
+            from .prompt.prompter import mk_message
+            messages.append(mk_message(lessons, role="user"))
+            log_write(args, seg, f"[MEMORY] Injected {memory.size} lessons")
+
     attempts = 0
+    tool_repair_fixes: list[str] = []
 
     if args.dry_run:
         return True
@@ -484,6 +678,9 @@ async def improve_coverage(
         if (attempts > args.max_attempts):
             log_write(args, seg, "Too many attempts, giving up")
             break
+
+        repair_passes_used = 0
+        repair_fixpoint_exhausted = False
 
         if not (response := await chatter.chat(messages, ctx=seg)):
             log_write(args, seg, "giving up")
@@ -512,27 +709,267 @@ async def improve_coverage(
 
         except subprocess.TimeoutExpired:
             log_write(args, seg, "measure_coverage timed out")
-            # FIXME is the built-in timeout reasonable? Do we prompt for a faster test?
-            # We don't want slow tests, but there may not be any way around it.
+            # Record timeout in DiagnosticIR + memory
+            ir = (
+                DiagnosticIRBuilder(language=backend.language_id, phase=Phase.RUN.value)
+                .timeout()
+                .tool(backend._default_tool_name())
+                .message("Test execution timed out")
+                .build()
+            )
+            if memory:
+                memory.record(ir, action="timeout", level=SuccessLevel.NONE)
+            _record_retry_event(seg, attempt=attempts, outcome="timeout", ir=ir)
+            if planner:
+                planner.update(seg.identify(), ir)
+            if trace_logger:
+                trace_logger.log_attempt(
+                    seg_id=seg.identify(), attempt=attempts,
+                    action="llm", ir=ir, outcome="timeout",
+                    tool_fixes=tool_repair_fixes,
+                    memory_injected=initial_memory_injected,
+                    extra={
+                        "blocker_injected": initial_blocker_injected,
+                        "repair_passes": repair_passes_used,
+                        "fixpoint_exhausted": repair_fixpoint_exhausted,
+                    },
+                )
             return True
 
         except subprocess.CalledProcessError as e:
             state.inc_counter('F')
-            error = backend.format_test_error(str(e.stdout, 'UTF-8', errors='ignore') if e.stdout else str(e))
+            raw_output = str(e.stdout, 'UTF-8', errors='ignore') if e.stdout else str(e)
+
+            # ── DiagnosticIR classification ──
+            ir = backend.classify_error(raw_output, phase=Phase.COMPILE.value)
+            log_write(args, seg,
+                f"[DIAG] {ir.short_summary()} "
+                f"(category={ir.error_category}, code={ir.error_code})")
+
+            # ── Phase 1: tool-first repair (bounded fixpoint) ──
+            repair_current_test = last_test
+            repair_current_ir = ir
+            repair_output: str | None = None
+            repair_pass = 0
+            repair_succeeded = False
+            while repair_orchestrator and repair_pass < MAX_TOOL_REPAIR_PASSES:
+                patched, fix_names = repair_orchestrator.try_tool_repair(
+                    repair_current_test, repair_current_ir, backend
+                )
+                if not fix_names or patched == repair_current_test:
+                    break
+
+                repair_pass += 1
+                repair_passes_used = repair_pass
+                tool_repair_fixes.extend(fix_names)
+                repair_current_test = patched
+                last_test = patched
+                log_write(
+                    args,
+                    seg,
+                    f"[REPAIR] Pass {repair_pass}/{MAX_TOOL_REPAIR_PASSES}: "
+                    f"Tool-first fixes applied: {fix_names}",
+                )
+
+                try:
+                    coverage = await backend.measure_test_coverage(
+                        seg,
+                        repair_current_test,
+                        isolate_tests=args.isolate_tests,
+                        branch_coverage=args.branch_coverage,
+                        log_write=log_cb,
+                    )
+                    log_write(
+                        args,
+                        seg,
+                        f"[REPAIR] Tool repair succeeded after pass {repair_pass} "
+                        f"— skipping LLM error prompt",
+                    )
+                    repair_succeeded = True
+                    break
+                except subprocess.CalledProcessError as repair_exc:
+                    repair_output = (
+                        str(repair_exc.stdout, 'UTF-8', errors='ignore')
+                        if repair_exc.stdout else str(repair_exc)
+                    )
+                    repair_current_ir = backend.classify_error(
+                        repair_output, phase=Phase.COMPILE.value
+                    )
+                    log_write(
+                        args,
+                        seg,
+                        f"[REPAIR] Pass {repair_pass}/{MAX_TOOL_REPAIR_PASSES}: "
+                        f"partial, new diagnostic {repair_current_ir.short_summary()} "
+                        f"(category={repair_current_ir.error_category}, "
+                        f"code={repair_current_ir.error_code})",
+                    )
+                    continue
+                except subprocess.TimeoutExpired:
+                    timeout_ir = (
+                        DiagnosticIRBuilder(language=backend.language_id, phase=Phase.RUN.value)
+                        .timeout()
+                        .tool(backend._default_tool_name())
+                        .message("Test execution timed out after tool repair")
+                        .build()
+                    )
+                    if memory:
+                        memory.record(
+                            timeout_ir,
+                            action="timeout_after_tool_repair",
+                            level=SuccessLevel.NONE,
+                        )
+                    _record_retry_event(seg, attempt=attempts, outcome="timeout", ir=timeout_ir)
+                    if planner:
+                        planner.update(seg.identify(), timeout_ir)
+                    if trace_logger:
+                        trace_logger.log_attempt(
+                            seg_id=seg.identify(), attempt=attempts,
+                            action="tool_repair", ir=timeout_ir, outcome="timeout",
+                            tool_fixes=tool_repair_fixes,
+                            memory_injected=initial_memory_injected,
+                            extra={
+                                "blocker_injected": initial_blocker_injected,
+                                "repair_passes": repair_passes_used,
+                                "fixpoint_exhausted": repair_fixpoint_exhausted,
+                            },
+                        )
+                    return True
+
+            if repair_succeeded:
+                pass
+            elif tool_repair_fixes:
+                repair_fixpoint_exhausted = True
+                log_write(
+                    args,
+                    seg,
+                    f"[REPAIR] Fixpoint exhausted after {repair_pass} pass(es) "
+                    f"— falling back to LLM",
+                )
+                if memory:
+                    memory.record(
+                        repair_current_ir,
+                        action=f"tool_repair_{repair_current_ir.error_category}",
+                        level=SuccessLevel.NONE,
+                    )
+                _record_retry_event(seg, attempt=attempts, outcome="F", ir=repair_current_ir)
+                if planner:
+                    planner.update(seg.identify(), repair_current_ir)
+                if trace_logger:
+                    trace_logger.log_attempt(
+                        seg_id=seg.identify(), attempt=attempts,
+                        action="tool_repair+llm", ir=repair_current_ir, outcome="F",
+                        tool_fixes=tool_repair_fixes,
+                        memory_injected=initial_memory_injected,
+                        extra={
+                            "blocker_injected": initial_blocker_injected,
+                            "repair_passes": repair_passes_used,
+                            "fixpoint_exhausted": repair_fixpoint_exhausted,
+                            "repair_terminal_category": repair_current_ir.error_category,
+                        },
+                    )
+                error = backend.format_test_error(repair_output or raw_output)
+                if memory:
+                    memory_hint = memory.format_entry_for_error(repair_current_ir)
+                    if memory_hint:
+                        error = error + "\n\n" + memory_hint
+                log_write(
+                    args,
+                    seg,
+                    f"[DEBUG] test FAILED after tool repair fixpoint. "
+                    f"Formatted error sent to LLM ({len(error)} chars):\n{error}\n",
+                )
+                if not (prompts := prompter.error_prompt(seg, error)):
+                    log_write(args, seg, "Test failed:\n\n" + error)
+                    break
+                messages.extend(prompts)
+                continue
+            else:
+                if memory:
+                    memory.record(ir, action=f"llm_{ir.error_category}",
+                                  level=SuccessLevel.NONE)
+                _record_retry_event(seg, attempt=attempts, outcome="F", ir=ir)
+                if planner:
+                    planner.update(seg.identify(), ir)
+                if trace_logger:
+                    trace_logger.log_attempt(
+                        seg_id=seg.identify(), attempt=attempts,
+                        action="llm", ir=ir, outcome="F",
+                        tool_fixes=[],
+                        memory_injected=initial_memory_injected,
+                        extra={
+                            "blocker_injected": initial_blocker_injected,
+                            "repair_passes": repair_passes_used,
+                            "fixpoint_exhausted": repair_fixpoint_exhausted,
+                        },
+                    )
+                # ── Phase 2: LLM fallback ──
+                error = backend.format_test_error(raw_output)
+                # Add memory-based hint
+                memory_hint = memory.format_entry_for_error(ir) if memory else None
+                if memory_hint:
+                    error = error + "\n\n" + memory_hint
+                log_write(args, seg, f"[DEBUG] test FAILED (exit {e.returncode}). "
+                           f"Formatted error sent to LLM ({len(error)} chars):\n{error}\n")
+                if not (prompts := prompter.error_prompt(seg, error)):
+                    log_write(args, seg, "Test failed:\n\n" + error)
+                    break
+                messages.extend(prompts)
+                continue
+
+        except RuntimeError as e:
+            state.inc_counter('F')
+            error = str(e)
+            ir = (
+                DiagnosticIRBuilder(language=backend.language_id, phase=Phase.COMPILE.value)
+                .fail()
+                .tool(backend._default_tool_name())
+                .error("unknown", "", error)
+                .build()
+            )
+            if memory:
+                memory.record(ir, action="runtime_error", level=SuccessLevel.NONE)
+            _record_retry_event(seg, attempt=attempts, outcome="F", ir=ir)
+            if trace_logger:
+                trace_logger.log_attempt(
+                    seg_id=seg.identify(), attempt=attempts,
+                    action="llm", ir=ir, outcome="F",
+                    tool_fixes=tool_repair_fixes,
+                    memory_injected=initial_memory_injected,
+                    extra={
+                        "blocker_injected": initial_blocker_injected,
+                        "repair_passes": repair_passes_used,
+                        "fixpoint_exhausted": repair_fixpoint_exhausted,
+                    },
+                )
+            log_write(args, seg, f"[DEBUG] test size limit exceeded: {error}")
             if not (prompts := prompter.error_prompt(seg, error)):
-                log_write(args, seg, "Test failed:\n\n" + error)
+                log_write(args, seg, "Test too large:\n\n" + error)
                 break
 
             messages.extend(prompts)
             continue
 
         result = coverage['files'].get(seg.filename, None)
+        if result is None:
+            # Debug: log available keys to diagnose key mismatch
+            available_keys = list(coverage['files'].keys())[:10]
+            log_write(args, seg, f"[DEBUG] coverage key mismatch! "
+                       f"seg.filename={seg.filename!r} not in coverage files. "
+                       f"Available keys (first 10): {available_keys}")
         new_lines = set(result['executed_lines']) if result else set()
         new_branches = set(tuple(b) for b in result['executed_branches']) if (result and \
                                                                               'executed_branches' in result) \
                        else set()
         gained_lines = seg.missing_lines.intersection(new_lines)
         gained_branches = seg.missing_branches.intersection(new_branches)
+
+        log_write(args, seg, f"[DEBUG] coverage check: "
+                   f"seg.missing_lines={sorted(seg.missing_lines)}, "
+                   f"new_executed={sorted(new_lines)[:20]}{'...' if len(new_lines)>20 else ''}, "
+                   f"total_new_lines={len(new_lines)}, "
+                   f"target_in_new={sorted(seg.missing_lines.intersection(new_lines))}, "
+                   f"gained_lines={sorted(gained_lines)}, "
+                   f"gained_branches={sorted(gained_branches)}")
 
         if args.show_details:
             print(seg.identify())
@@ -543,9 +980,62 @@ async def improve_coverage(
 
         if not gained_lines and not gained_branches:
             state.inc_counter('U')
+            # Record as useless (ok but no coverage gain)
+            ir = (
+                DiagnosticIRBuilder(language=backend.language_id, phase=Phase.COVERAGE.value)
+                .ok()
+                .tool(backend._default_tool_name())
+                .message("Test compiled and ran but gained no new coverage")
+                .coverage_delta(0.0, 0.0)
+                .build()
+            )
+            blocker_prompt_injected = False
+            if planner:
+                planner.update(seg.identify(), ir)
+            if memory:
+                memory.record(ir, action="llm", level=SuccessLevel.PARTIAL)
+            _record_retry_event(seg, attempt=attempts, outcome="U", ir=ir)
+            log_write(args, seg, f"[DEBUG] USELESS: test compiled & ran but gained no coverage. "
+                       f"This usually means the test doesn't exercise the target lines/branches.")
+
+            # ── Re-inject blocker analysis for missing_coverage_prompt ──
+            if use_blocker:
+                try:
+                    blockers = extract_blockers(
+                        seg.path, seg.missing_lines, seg.missing_branches,
+                        seg.executed_lines, backend.language_id,
+                    )
+                    seg._latest_blockers = blockers  # type: ignore[attr-defined]
+                    blocker_text = format_blockers_for_prompt(blockers)
+                except Exception:
+                    blocker_text = ""
+            else:
+                blocker_text = ""
+
             if not (prompts := prompter.missing_coverage_prompt(seg, seg.missing_lines, seg.missing_branches)):
                 log_write(args, seg, "Test doesn't improve coverage")
                 break
+
+            if blocker_text:
+                from .prompt.prompter import mk_message
+                # Insert blocker BEFORE the missing_coverage prompt
+                # so LLM sees "why not reached" before "what to cover"
+                prompts.insert(0, mk_message(blocker_text, role="user"))
+                blocker_prompt_injected = True
+
+            if trace_logger:
+                trace_logger.log_attempt(
+                    seg_id=seg.identify(), attempt=attempts,
+                    action="tool_repair+llm" if tool_repair_fixes else "llm",
+                    ir=ir, outcome="U",
+                    tool_fixes=tool_repair_fixes,
+                    memory_injected=initial_memory_injected,
+                    extra={
+                        "blocker_injected": initial_blocker_injected or blocker_prompt_injected,
+                        "repair_passes": repair_passes_used,
+                        "fixpoint_exhausted": repair_fixpoint_exhausted,
+                    },
+                )
 
             messages.extend(prompts)
             continue
@@ -556,6 +1046,41 @@ async def improve_coverage(
         new_test_path = backend.save_successful_test(seg, last_test, asked, gained)
         log_write(args, seg, f"Saved as {new_test_path}\n")
         state.inc_counter('G')
+
+        # Record success in DiagnosticIR + memory + planner
+        delta_l = len(gained_lines) / max(len(seg.missing_lines), 1)
+        delta_b = len(gained_branches) / max(len(seg.missing_branches), 1) if seg.missing_branches else 0.0
+        ir = (
+            DiagnosticIRBuilder(language=backend.language_id, phase=Phase.COVERAGE.value)
+            .ok()
+            .tool(backend._default_tool_name())
+            .message(f"Gained {len(gained_lines)} lines, {len(gained_branches)} branches")
+            .coverage_delta(delta_l, delta_b)
+            .build()
+        )
+        if memory:
+            action = "tool_repair+llm" if tool_repair_fixes else "llm"
+            memory.record(ir, action=action, level=SuccessLevel.FULL)
+        _record_retry_event(seg, attempt=attempts, outcome="G", ir=ir)
+        if planner:
+            planner.update(seg.identify(), ir)
+        if trace_logger:
+            trace_logger.log_attempt(
+                seg_id=seg.identify(), attempt=attempts,
+                action="tool_repair+llm" if tool_repair_fixes else "llm",
+                ir=ir, outcome="G",
+                tool_fixes=tool_repair_fixes,
+                memory_injected=initial_memory_injected,
+                extra={
+                    "blocker_injected": initial_blocker_injected,
+                    "repair_passes": repair_passes_used,
+                    "fixpoint_exhausted": repair_fixpoint_exhausted,
+                },
+            )
+
+        if tool_repair_fixes:
+            log_write(args, seg,
+                f"[AGENT] Tool repairs used: {tool_repair_fixes} in this segment")
 
         if args.save_coverage_to:
             target_path = Path(new_test_path)
@@ -569,15 +1094,31 @@ async def improve_coverage(
 
 
 def main():
-    global state
+    global state, memory, repair_orchestrator, planner, trace_logger, use_blocker
     args = parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
+        print(f"[CoverUp] Seed: {args.seed}")
+
+    # ── CoverAgent-ML: initialise agent modules (respecting ablation flags) ──
+    memory = ReflectiveMemory() if not args.no_agent_memory else None
+    repair_orchestrator = RepairOrchestrator() if not args.no_agent_repair else None
+    # Planner is initialised later (after we know segment count) for size-adaptive tuning
+    planner = None  # set below after segment counting
+    _planner_enabled = not args.no_agent_planner
+    trace_logger = TraceLogger(args.trace_log) if args.trace_log else None
+    use_blocker = not args.no_agent_blocker
 
     backend_map: dict[str, type[LanguageBackend]] = {
         'python': PythonBackend,
         'go': GoBackend,
+        'rust': RustBackend,
     }
 
     backend = backend_map[args.language](args)
+    initial_coverage_text: str | None = None
+    final_coverage_text: str | None = None
+    total_segments: int | None = None
 
     try:
         backend.prepare_environment()
@@ -645,7 +1186,9 @@ def main():
                     print("Error measuring coverage:\n" + str(e.stdout, 'UTF-8', errors='ignore'))
                     return 1
 
-        print(summary_coverage(coverage, args.source_files))
+        initial_coverage_text = summary_coverage(coverage, args.source_files)
+        print(initial_coverage_text)
+        print(f"[CoverUp] Initial coverage: {initial_coverage_text}")
         # TODO also show running coverage estimate
 
         chatter.set_add_cost(state.add_cost)
@@ -667,39 +1210,128 @@ def main():
                 # Only mark done if was able to complete (True return),
                 # so that it can be retried after installing any missing modules
                 state.mark_done(seg)
+                if planner:
+                    planner.mark_completed(seg.identify())
 
             if args.checkpoint:
                 state.save_checkpoint(args.checkpoint)
             progress.signal_one_completed()
 
-        worklist = []
-        seg_done_count = 0
+        # Build filtered segment list first so targeted reruns have a stable scope.
+        candidate_segments: list[CodeSegment] = []
         for seg in segments:
             if not seg.path.is_relative_to(args.src_base_dir):
                 continue
-
             if args.source_files and seg.path not in args.source_files:
                 continue
+            if not _segment_matches_focus_filters(args, seg):
+                continue
+            candidate_segments.append(seg)
 
+        if args.max_segments is not None:
+            if args.max_segments <= 0:
+                print("--max-segments must be > 0")
+                return 1
+            candidate_segments = candidate_segments[:args.max_segments]
+
+        if not candidate_segments:
+            print("No coverage segments matched the requested filters.")
+            if _filters_active(args):
+                print(f"  focus-file={args.focus_files or '-'}")
+                print(f"  focus-segment={args.focus_segments or '-'}")
+                print(f"  focus-name={args.focus_names or '-'}")
+                print(f"  max-segments={args.max_segments if args.max_segments is not None else '-'}")
+            preview = [seg.identify() for seg in segments[:10]]
+            if preview:
+                print("  Example available segments:")
+                for seg_id in preview:
+                    print(f"    {seg_id}")
+            return 1
+
+        if _filters_active(args):
+            print(f"[CoverUp] Targeted rerun selected {len(candidate_segments)} segment(s):")
+            for seg in candidate_segments[:10]:
+                print(f"  - {seg.identify()} (missing={seg.missing_count()}, name={seg.name})")
+            if len(candidate_segments) > 10:
+                print(f"  ... {len(candidate_segments) - 10} more")
+
+        # Build segment lookup: seg.identify() → seg
+        seg_lookup: dict[str, CodeSegment] = {}
+        worklist = []
+        seg_done_count = 0
+        for seg in candidate_segments:
             if state.is_done(seg):
                 seg_done_count += 1
             else:
-                worklist.append(work_segment(seg))
+                seg_id = seg.identify()
+                seg_lookup[seg_id] = seg
+                worklist.append(seg)  # store segments, not coroutines
 
-        progress = Progress(total=len(worklist)+seg_done_count, initial=seg_done_count)
+        # ── Size-adaptive planner initialisation ──
+        num_segments = len(worklist)
+        if _planner_enabled:
+            if num_segments < 20:
+                # Small project: less exploration, more passes (conservative)
+                planner = UCBPlanner(c=0.8, min_passes=2)
+            elif num_segments > 80:
+                # Large project: more exploration, benefit from learning
+                planner = UCBPlanner(c=2.0, min_passes=2)
+            else:
+                # Medium project: defaults
+                planner = UCBPlanner(c=1.5, min_passes=2)
+            print(f"[CoverAgent-ML] Planner: c={planner.c}, "
+                  f"min_passes={planner.min_passes}, segments={num_segments}")
+
+        # Register arms after planner is created
+        for seg in worklist:
+            if planner:
+                planner.add_arm(
+                    seg.identify(),
+                    missing_lines=len(seg.missing_lines),
+                    missing_branches=len(seg.missing_branches),
+                )
+
+        progress = Progress(total=len(seg_lookup)+seg_done_count, initial=seg_done_count)
+        total_segments = len(seg_lookup) + seg_done_count
         state.set_progress_bar(progress)
 
         async def run_it():
-            if args.max_concurrency:
-                semaphore = asyncio.Semaphore(args.max_concurrency)
+            concurrency = args.max_concurrency or len(seg_lookup) or 1
 
-                async def sem_coro(coro):
-                    async with semaphore:
-                        return await coro
+            if planner and not args.no_agent_planner:
+                # ── Batch-wave loop driven by planner.select_batch() ──
+                # Each wave: planner picks top-k segments, we run them
+                # concurrently, then planner re-scores for the next wave.
+                semaphore = asyncio.Semaphore(concurrency)
+                while planner.has_active_arms():
+                    batch_ids = planner.select_batch(k=concurrency)
+                    if not batch_ids:
+                        break
 
-                await asyncio.gather(*(sem_coro(c) for c in worklist))
+                    async def sem_work(s):
+                        async with semaphore:
+                            await work_segment(s)
+
+                    batch_coros = []
+                    for sid in batch_ids:
+                        seg = seg_lookup.get(sid)
+                        if seg and not state.is_done(seg):
+                            batch_coros.append(sem_work(seg))
+                    if not batch_coros:
+                        break
+                    await asyncio.gather(*batch_coros)
             else:
-                await asyncio.gather(*worklist)
+                # ── Baseline: schedule all segments at once ──
+                if concurrency < len(worklist):
+                    semaphore = asyncio.Semaphore(concurrency)
+
+                    async def sem_coro(s):
+                        async with semaphore:
+                            await work_segment(s)
+
+                    await asyncio.gather(*(sem_coro(s) for s in worklist))
+                else:
+                    await asyncio.gather(*(work_segment(s) for s in worklist))
 
         try:
             asyncio.run(run_it())
@@ -708,8 +1340,28 @@ def main():
             if args.checkpoint:
                 state.save_checkpoint(args.checkpoint)
             return 1
+        finally:
+            # Suppress noisy "Fatal error on SSL transport" messages that
+            # Python 3.10 asyncio spews when the event loop closes while
+            # httpx/litellm still have open SSL connections.  These are
+            # harmless but alarming-looking.
+            import logging
+            logging.getLogger("asyncio").setLevel(logging.CRITICAL)
 
         progress.close()
+
+        # ── CoverAgent-ML: print agent statistics ──
+        if memory and memory.size > 0:
+            print(f"\n[CoverAgent-ML] Memory: {memory.size} lessons recorded")
+            stats = memory.get_stats()
+            if stats:
+                print(f"  Error categories: {stats}")
+        if planner:
+            gs = planner.get_global_stats()
+            print(f"  Planner: {gs['total_pulls']} pulls across {gs['num_arms']} arms")
+        if trace_logger:
+            trace_logger.close()
+            print(f"  Trace log written to: {args.trace_log}")
 
     # --- (3) clean up resulting test suite ---
 
@@ -733,7 +1385,9 @@ def main():
             print("Error measuring coverage:\n" + str(e.stdout, 'UTF-8', errors='ignore'))
             return 1
 
-        print(summary_coverage(coverage, args.source_files))
+        final_coverage_text = summary_coverage(coverage, args.source_files)
+        print(final_coverage_text)
+        print(f"[CoverUp] Final coverage: {final_coverage_text}")
 
     # --- (5) save state and show missing modules, if appropriate
 
@@ -749,5 +1403,28 @@ def main():
                         f.write(f"{module}\n")
     elif args.prompt_for_tests and args.skip_suite_measurement:
         print("Skipping final coverage measurement due to --skip-suite-measurement.")
+
+    if args.prompt_for_tests:
+        summary = {
+            "seed": args.seed,
+            "model": args.model,
+            "language": args.language,
+            "initial_coverage": float(initial_coverage_text.rstrip('%'))
+                if initial_coverage_text else None,
+            "final_coverage": float(final_coverage_text.rstrip('%'))
+                if final_coverage_text else None,
+            "cost_usd": round(state.get_cost(), 4),
+            "counters": state.get_counters(),
+            "segments_total": total_segments,
+            "memory_lessons": memory.size if memory else 0,
+            "planner_pulls": planner.get_global_stats()["total_pulls"] if planner else 0,
+            "planner_arms": planner.get_global_stats()["num_arms"] if planner else 0,
+            "trace_log": args.trace_log,
+            "blocker_enabled": use_blocker,
+            "semantic_recovery_enabled": bool(args.semantic_recovery),
+            "tool_repair_fixpoint_enabled": repair_orchestrator is not None,
+            "max_tool_repair_passes": MAX_TOOL_REPAIR_PASSES,
+        }
+        print(f"[CoverUp] Summary JSON: {json.dumps(summary, sort_keys=True)}")
 
     return 0

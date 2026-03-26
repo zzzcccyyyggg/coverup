@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CoverUp Studio</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">CoverUp Studio</p>
+          <h1>Upload a repository, launch coverage-guided test generation, and ship only the tests that proved useful.</h1>
+          <p class="hero-text">
+            This console wraps the existing CoverUp CLI so we can treat test generation as a trackable job:
+            archive in, run starts, evidence lands, valid tests come back out.
+          </p>
+        </div>
+        <div class="hero-panel">
+          <div class="hero-stat">
+            <span>Focus</span>
+            <strong>Coverage-guided runs</strong>
+          </div>
+          <div class="hero-stat">
+            <span>Artifacts</span>
+            <strong>Logs, trace, generated tests</strong>
+          </div>
+          <div class="hero-stat">
+            <span>Outputs</span>
+            <strong>Coverage delta + valid test bundle</strong>
+          </div>
+        </div>
+      </header>
+
+      <main class="dashboard">
+        <section class="card upload-card">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Launch</p>
+              <h2>Repository Run</h2>
+            </div>
+            <span class="section-note">Archive the repo root as <code>.zip</code>, <code>.tar.gz</code>, or <code>.tgz</code>.</span>
+          </div>
+
+          <form id="job-form" class="job-form">
+            <label class="dropzone" for="archive">
+              <input id="archive" name="archive" type="file" accept=".zip,.tar,.tar.gz,.tgz" required />
+              <span class="dropzone-title">Drop a repository archive here</span>
+              <span class="dropzone-subtitle">or click to choose one from disk</span>
+              <span id="archive-name" class="archive-name">No archive selected yet.</span>
+            </label>
+
+            <div class="field-grid">
+              <label>
+                <span>Language</span>
+                <select id="language" name="language"></select>
+              </label>
+
+              <label>
+                <span>Model</span>
+                <select id="model" name="model"></select>
+              </label>
+
+              <label>
+                <span>Prompt family</span>
+                <select id="prompt" name="prompt"></select>
+              </label>
+
+              <label>
+                <span>Key family</span>
+                <select id="key-family" name="key_family"></select>
+              </label>
+
+              <label>
+                <span>API key</span>
+                <input id="api-key" name="api_key" type="password" placeholder="Optional, passed only to this run" />
+              </label>
+
+              <label>
+                <span>Max attempts</span>
+                <input id="max-attempts" name="max_attempts" type="number" min="1" max="25" value="3" />
+              </label>
+
+              <label>
+                <span>Package dir override</span>
+                <input id="package-dir" name="package_dir" type="text" placeholder="Optional, relative to repo root" />
+              </label>
+
+              <label>
+                <span>Tests dir override</span>
+                <input id="tests-dir" name="tests_dir" type="text" placeholder="Optional, mainly for Python repos" />
+              </label>
+            </div>
+
+            <div class="form-actions">
+              <button id="start-button" type="submit" class="primary-button">Upload &amp; Start</button>
+              <p id="form-status" class="form-status">Waiting for a repository archive.</p>
+            </div>
+          </form>
+        </section>
+
+        <section class="card run-card">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Current run</p>
+              <h2>Live Status</h2>
+            </div>
+            <span id="status-pill" class="status-pill idle">Idle</span>
+          </div>
+
+          <div id="run-summary" class="run-summary empty-state">
+            <p>No job started yet. Once a run begins, coverage delta, counters, and generated test files will appear here.</p>
+          </div>
+
+          <div class="results-grid">
+            <article class="result-panel">
+              <div class="panel-head">
+                <h3>Generated Tests</h3>
+                <a id="download-link" class="download-link disabled" href="#" aria-disabled="true">Download bundle</a>
+              </div>
+              <ul id="generated-tests" class="artifact-list">
+                <li class="muted">No generated tests yet.</li>
+              </ul>
+            </article>
+
+            <article class="result-panel">
+              <div class="panel-head">
+                <h3>Recent Jobs</h3>
+              </div>
+              <ul id="recent-jobs" class="artifact-list">
+                <li class="muted">No runs recorded yet.</li>
+              </ul>
+            </article>
+          </div>
+        </section>
+
+        <section class="card log-card">
+          <div class="section-head">
+            <div>
+              <p class="section-kicker">Telemetry</p>
+              <h2>Live Log Tail</h2>
+            </div>
+            <span class="section-note">Updates automatically while a run is active.</span>
+          </div>
+          <pre id="log-output" class="log-output">No log output yet.</pre>
+        </section>
+      </main>
+    </div>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

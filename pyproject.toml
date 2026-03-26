@@ -29,6 +29,13 @@ dependencies = [
     "litellm>=1.33.1"
 ]
 
+[project.optional-dependencies]
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.9",
+]
+
 [build-system]
 requires = [
     "setuptools>61",
@@ -39,7 +46,15 @@ build-backend = "setuptools.build_meta"
 
 [project.scripts]
 coverup = "coverup.coverup:main"
+coverup-web = "coverup.webapp:main"
 
 [project.urls]
 "Homepage" = "https://github.com/plasma-umass/coverup"
 "Repository" = "https://github.com/plasma-umass/coverup"
+
+[tool.setuptools.package-data]
+coverup = [
+    "webui/*.html",
+    "webui/*.css",
+    "webui/*.js",
+]

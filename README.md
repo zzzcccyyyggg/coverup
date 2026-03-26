@@ -56,6 +56,17 @@ $ coverup --package src/mymod --tests tests
 ```
 CoverUp then creates tests named `test_coverup_N.py`, where `N` is a number, under the `tests` directory.
 
+### Web Console
+CoverUp also includes a lightweight web console for uploading a repository archive, launching a run, monitoring the job, and downloading the newly generated valid tests:
+
+```shell
+$ python3 -m pip install .[web]
+$ coverup-web --host 127.0.0.1 --port 8000
+```
+
+Then open `http://127.0.0.1:8000` in your browser.
+The console accepts `.zip`, `.tar`, `.tar.gz`, and `.tgz` repository archives and stores run artifacts under `.coverup-web/` by default.
+
 ### Example
 Here we have CoverUp create additional tests for the popular package [Flask](https://flask.palletsprojects.com/):
 ```
@@ -101,6 +112,36 @@ The bars show the difference in coverage percentage between CoverUp and CodaMosa
 green bars, above 0, indicate that CoverUp achieved a higher coverage.
 
 As the graph shows, CoverUp achieves higher coverage than CodaMosa for most modules.
+
+<br/>
+
+## Go Language Support
+
+CoverUp now supports generating tests for **Go** projects. The Go backend provides:
+
+- **Static analysis** via tree-sitter: symbol lookup (`get_info`), branch inference, receiver context extraction
+- **Branch coverage guidance**: infers logical branches from `if/else`, `switch/case`, `select` and feeds them into prompts
+- **Dynamic prompt hints**: automatically detects patterns (interface, error handling, goroutine, context, file I/O, etc.) and adds Go-specific testing guidance
+- **LLM tool function**: exposes `get_info` so the LLM can query Go type definitions, function signatures and methods during generation
+
+### Using CoverUp for Go
+
+```shell
+$ coverup --language go --package-dir /path/to/your/go/module --model gpt-4o
+```
+
+Example with the [Cobra](https://github.com/spf13/cobra) CLI framework:
+```shell
+$ coverup --language go --package-dir src/cobra --model gpt-4o --prompt gpt-go-v1
+```
+
+### Go Requirements
+- Go 1.20+ installed and in PATH
+- Python 3.10+ with `tree-sitter` and `tree-sitter-languages` packages
+- LLM API key (same as Python usage)
+
+For detailed testing instructions, see [docs/testing-guide.md](docs/testing-guide.md).
+For technical details on Go support improvements, see [docs/go_generation_updates.md](docs/go_generation_updates.md).
 
 <br/>
 
