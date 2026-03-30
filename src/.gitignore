@@ -1,1 +1,5 @@
 CoverUp.egg-info
+click/
+cobra/
+flask/
+validator/
