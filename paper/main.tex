@@ -1,0 +1,630 @@
+\documentclass[10pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{amsmath}
+
+\setlength{\emergencystretch}{2em}
+
+\title{Failure-Layer-Aware Recovery for Coverage-Guided LLM Test Generation}
+\author{Draft for Internal Collaboration}
+\date{March 26, 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Large language models have improved automated test generation, yet many coverage-guided pipelines still treat failed attempts as coarse retries. Coverage explains \emph{where} execution is missing, but it does not explain \emph{why} a candidate test failed to compile, failed to execute, or failed to increase coverage. We present \textsc{CoverAgent-ML}, a coverage-guided recovery architecture that makes retries failure-layer-aware. The system converts each failed attempt into a language-agnostic diagnostic representation, applies a bounded tool-first fixpoint of deterministic repairs, and only then falls back to another model round. This design keeps orchestration common across languages while allowing a small set of language-specific recovery operators beneath the same control plane. We position the paper as a systems study of structured recovery rather than as a benchmark-dominance or bug-finding paper. Under that scope, the paper makes three claims: failed attempts should be handled according to failure layer rather than as homogeneous retries; a unified diagnosis-and-repair interface makes the multi-language story defensible without pretending that all languages are equally mature; and the main evaluation object for these systems should be the recovery path, not final coverage alone. The present draft completes the problem framing, method, system design, implementation, related work, and claim boundaries, while leaving the final experimental section to be filled from the ongoing trace-centered study.
+\end{abstract}
+
+\section{Introduction}
+
+Automated unit test generation has advanced substantially through hybrid search, mutation guidance, iterative prompting, and static-analysis-assisted large language model (LLM) pipelines~\cite{lemieux2023codamosa,pizzorno2025coverup,alshahwan2024testgenllm,pan2024aster,chu2025palm,gu2025panta}. Recent systems can often generate compilable tests and improve coverage on realistic projects, while language-specific work such as PALM and RUG shows that stronger recovery or analysis is especially important for hard targets such as Rust~\cite{chu2025palm,cheng2025rug}. At the same time, these systems still encounter a recurring operational problem: once a generated attempt fails, the feedback loop often becomes too coarse. The system may know that a target region is still uncovered, but it often lacks a principled way to decide whether the next action should be another LLM round, a deterministic repair, a change in prompt context, or a shift to a different target.
+
+This gap matters because coverage alone is fundamentally incomplete. It explains \emph{where} execution is missing, but not \emph{why} the current attempt failed. In practice, those failures arise at different layers. A test may fail because it uses the wrong call shape, targets a private interface, assumes the wrong output channel, encodes a brittle oracle, violates language-specific type or ownership constraints, or simply misunderstands the behavior of the code under test. Treating all of these cases as homogeneous retries wastes budget and obscures what the system is actually doing.
+
+Prior work already hints at pieces of this problem. \textsc{CoverUp} shows the value of iterative coverage-guided prompting for Python~\cite{pizzorno2025coverup}. ASTER demonstrates that a static-analysis-guided test generation pipeline can extend across languages~\cite{pan2024aster}. PALM and Panta show that stronger program analysis can materially improve test generation on harder targets~\cite{chu2025palm,gu2025panta}. Industrial systems such as TestGen-LLM highlight the importance of validation and filtering in practice~\cite{alshahwan2024testgenllm}. However, the literature still emphasizes final coverage and per-attempt success more than the \emph{structure of the retry loop itself}. As a result, it remains hard to answer a systems question that is central to reliable LLM-based test generation: \emph{how should the system react after an attempt fails?}
+
+Our answer is to make retries failure-layer-aware. We build a coverage-guided recovery loop in which each attempt is executed, diagnosed into a language-agnostic intermediate representation, and routed through a bounded tool-first fixpoint before another model round. Reachability-oriented hints help the model reason about why target code is not being reached; a unified diagnosis-and-repair interface keeps orchestration common across languages; and language-specific operators absorb the dominant failure families that differ between Python, Go, and Rust.
+
+This framing also clarifies what the paper is \emph{not} claiming. We do not position the work as a bug-finding paper, and we do not claim stable cross-language dominance. Recent critiques show that pass-oriented LLM test generators can validate buggy behavior instead of exposing it, especially when their oracles are designed to pass~\cite{mathews2024designchoices}. Our scope is therefore narrower and, we believe, more defensible: we study structured recovery in coverage-guided regression test generation, and we evaluate whether the loop changes \emph{how} the system recovers, not only whether a single aggregate coverage number goes up.
+
+Under that scope, our main contributions are:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item We present a \emph{failure-layer-aware recovery loop} for coverage-guided LLM test generation, in which failed attempts are explicitly diagnosed and routed through bounded recovery actions before retry.
+    \item We introduce a unified \emph{diagnosis-and-repair abstraction} that separates language-agnostic orchestration from language-specific recovery operators, making the multi-language story about a shared control plane rather than about raw language count.
+    \item We show how a \emph{bounded tool-first fixpoint} can turn some retries from blind generation into structured recovery, while keeping deterministic repair under explicit control.
+    \item We frame the multi-language contribution as a \emph{cross-language failure-layer study}: the same orchestration pattern operates across Python, Go, and Rust, but the dominant failure layers differ substantially by language.
+\end{enumerate}
+
+The remainder of the paper is organized as follows. Section~\ref{sec:motivation} uses two motivating examples to show why structured recovery is necessary. Section~\ref{sec:problem} defines the problem setting and design goals. Sections~\ref{sec:architecture}--\ref{sec:implementation} describe the recovery architecture, the language-specific instantiations, and the implementation. Section~\ref{sec:related} discusses related work. Sections~\ref{sec:discussion} and~\ref{sec:threats} state claim boundaries, limitations, and threats to validity. The experimental section is intentionally left for final completion once the ongoing trace-centered study is frozen.
+
+\section{Motivating Examples}
+\label{sec:motivation}
+
+The paper is best motivated by two complementary examples: one in which structured recovery turns a failed attempt into a useful test, and one in which structured recovery changes the behavior of the system without yet producing a positive outcome.
+
+\subsection{A Repair-Assisted Positive}
+
+Consider a Python target in which the model tries to cover a branch associated with a framework-provided decorator. A naive generated test can fail for superficial reasons before the system ever reaches the relevant behavior. For example, the candidate may call an option-configuration helper with a mixed positional/keyword shape that is syntactically accepted by the prompt but invalid in the target framework. If the system responds with another unconstrained model retry, the next attempt often changes too many details at once, making the process both expensive and opaque.
+
+In our loop, the first failed attempt is not treated as just another failed sample. Instead, the system diagnoses the failure as a call-shape or oracle-layer issue, runs one or more bounded deterministic repairs, and re-executes the revised candidate before spending another model call. This has two effects. First, it suppresses a class of avoidable failures that do not warrant fresh generation. Second, it exposes the next, deeper failure layer---often an assertion or oracle mismatch that is much more informative than the original malformed call. In positive cases, the system then reaches a valid, coverage-increasing test after the repaired attempt or after one additional LLM round informed by the updated failure.
+
+\subsection{A Harder Negative with Mechanism Value}
+
+Now consider a harder Go target involving command-line behavior, helper-process execution, or help-command semantics. Here a naive retry loop may repeatedly fail at shallow levels, such as formatting assumptions or incorrect exit-path expectations. A structured recovery loop can still be useful even when the slice does not yet turn positive. By normalizing brittle output checks, marking unused bindings, or refining helper-process setup, the system can move the frontier away from shallow formatting noise and toward deeper semantic mismatches about command behavior or argument validation.
+
+This kind of example is important because it clarifies the claim boundary. The contribution is not ``we always win after repair.'' The stronger and more realistic systems claim is that structured recovery changes \emph{how} the system fails. Even a negative outcome can be informative if the loop consistently moves the frontier from superficial executability problems into behaviorally meaningful failure layers.
+
+\subsection{What These Examples Show}
+
+Taken together, the positive and harder-negative examples establish two requirements for the paper. First, the method must explain how the system decides what to do after failure. Second, the evaluation must expose recovery behavior rather than reporting only final coverage. These requirements directly shape the rest of the design.
+
+\section{Problem Setting and Design Goals}
+\label{sec:problem}
+
+\subsection{Problem Setting}
+
+We study coverage-guided regression test generation for existing software repositories. The system takes as input a project with an executable test harness, identifies code regions that are insufficiently covered by the current suite, and generates candidate tests intended to improve coverage while remaining compatible with the repository's existing build and test workflow.
+
+This setting imposes three constraints.
+
+\paragraph{Coverage is only a partial signal.}
+Coverage can tell the system where behavior has not yet been exercised, but it cannot by itself explain why the current attempt failed to reach the target.
+
+\paragraph{Failures arise at multiple layers.}
+Candidate tests can fail before execution, during setup, during assertion checking, or due to deeper misunderstandings of the behavior under test. These layers differ materially in how the system should respond.
+
+\paragraph{Language ecosystems matter.}
+Even under one shared orchestration loop, Python, Go, and Rust differ in package layout, build behavior, visibility boundaries, test idioms, and dominant failure families. A credible multi-language system must absorb these differences without devolving into three unrelated pipelines.
+
+\subsection{Why Coverage-Guided Retry Is Not Enough}
+
+Coverage-guided prompting is already a strong idea: it focuses generation on what matters. But a pure retry loop still leaves the hardest systems question unresolved. Once an attempt fails, a coverage-guided system must choose among several fundamentally different actions:
+
+\begin{itemize}[leftmargin=1.4em]
+    \item retry generation with a better prompt,
+    \item repair the candidate deterministically,
+    \item alter the contextual explanation of the target,
+    \item change the target itself, or
+    \item stop because the slice has become too costly or too semantically hard.
+\end{itemize}
+
+Without structured failure handling, the system tends to overuse the first option. This produces a pipeline that appears active but is often operationally blind.
+
+\subsection{Design Goals}
+
+The system is designed around four goals.
+
+\paragraph{G1: Make failure handling explicit.}
+Failed attempts should be transformed into structured objects that support control decisions, not treated as free-form log strings.
+
+\paragraph{G2: Keep orchestration shared across languages.}
+The multi-language story should rest on a common control plane rather than on independent, language-specific ad hoc scripts.
+
+\paragraph{G3: Prefer low-cost, checkable recovery before another model call.}
+If a failure can be addressed through a deterministic operator, the system should exploit that option before spending another LLM round.
+
+\paragraph{G4: Preserve evidence about how recovery behaves.}
+The system should record enough trace information to explain whether an outcome was driven by prompt-only retries, repair-assisted transitions, or persistent harder negatives.
+
+\subsection{Non-Goals}
+
+We explicitly exclude several broader claims from the scope of the paper.
+
+\begin{itemize}[leftmargin=1.4em]
+    \item We do not claim to find bugs reliably.
+    \item We do not claim stable benchmark-wide superiority across all languages.
+    \item We do not claim that every positive result depends on the full recovery stack.
+    \item We do not claim that the maturity of language-specific recovery is currently uniform.
+\end{itemize}
+
+These non-goals are not weaknesses of the paper; they are necessary boundaries that keep the contribution precise and defensible.
+
+\section{System Architecture}
+\label{sec:architecture}
+
+\subsection{High-Level View}
+
+\textsc{CoverAgent-ML} is organized around three layers.
+
+\paragraph{Reachability layer.}
+The system begins from coverage segments and optional reachability-oriented hints. This layer upgrades raw missing-coverage feedback into information that is closer to ``what precondition or control context is currently absent.'' The goal is not full path-feasibility solving; it is to sharpen generation around likely blocking conditions.
+
+\paragraph{Recovery layer.}
+After each candidate test is executed, the system converts the observed outcome into a structured diagnostic object. That object determines whether deterministic repair should run, whether another LLM retry is justified, and what lesson should be recorded for future attempts.
+
+\paragraph{Language-adaptation layer.}
+The repair operators themselves are language-specific, but they live beneath a common orchestration interface. The system thus shares one recovery loop across languages while allowing the concrete failure operators to vary.
+
+\subsection{End-to-End Loop}
+
+Algorithmically, one iteration of the system proceeds as follows:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item select a coverage segment or target region,
+    \item gather repository context and optional reachability hints,
+    \item prompt the model for a candidate test,
+    \item execute the candidate under the language-specific backend,
+    \item transform the outcome into a structured diagnostic object,
+    \item run a bounded sequence of deterministic repairs when appropriate,
+    \item re-execute or fall back to another model round using the updated failure context,
+    \item record the resulting trace event and coverage delta.
+\end{enumerate}
+
+This loop differs from memoryless retry in two important ways. First, it treats failure classification as a first-class control decision. Second, it allows deterministic operators to consume some failures before the next model round is even considered.
+
+\subsection{Reachability Hints as Lightweight Control Signals}
+
+Raw coverage feedback often under-specifies the problem. A missing branch can mean that the generated test reached the relevant function but took the wrong path, or that it never exercised the precondition chain required to enter the function at all. The system therefore supports lightweight reachability hints, also called blockers, that summarize likely reasons a target is not being reached.
+
+These hints are intentionally lightweight. The architecture does not depend on complete symbolic reasoning or heavyweight interprocedural analysis. Instead, it uses partial structural signals to move the prompt from ``this code is uncovered'' toward ``this code appears gated by these conditions or contexts.'' This supports the generation step without turning the whole method into a program-analysis paper.
+
+\section{Failure-Layer-Aware Recovery}
+\label{sec:recovery}
+
+\subsection{Failure Layers}
+
+The central methodological move of the paper is to treat failed attempts as heterogeneous. In our setting, a failed attempt can lie at one of several broad layers:
+
+\begin{itemize}[leftmargin=1.4em]
+    \item \textbf{Executability:} the candidate does not parse, compile, import, or build.
+    \item \textbf{Call shape or signature:} the candidate invokes an interface using the wrong argument structure.
+    \item \textbf{Visibility or public surface:} the candidate refers to non-exported or non-public interfaces, fields, or paths.
+    \item \textbf{Assertion or oracle:} the test executes but encodes a brittle or incorrect expectation.
+    \item \textbf{Behavioral or semantic:} the candidate misunderstands the meaning of the target behavior.
+\end{itemize}
+
+These layers imply different next actions. An executability failure often warrants deterministic repair before another model call. A brittle output oracle may warrant normalization or helper synthesis. A deeper semantic failure may justify another model round with more precise context or a different target entirely.
+
+\subsection{DiagnosticIR}
+
+To operationalize this idea across languages, the system routes failures through a language-agnostic intermediate form, \texttt{DiagnosticIR}. The IR records:
+
+\begin{itemize}[leftmargin=1.4em]
+    \item execution phase,
+    \item coarse failure category,
+    \item optional error code or normalized label,
+    \item location and message context when available,
+    \item auxiliary fields relevant to deterministic operators and later prompts.
+\end{itemize}
+
+This design serves two purposes. First, it makes failure handling explicit and machine-actionable. Second, it gives the multi-language story a shared systems interface instead of a collection of unrelated prompt heuristics.
+
+\subsection{Routing Policy}
+
+Once a failure has been normalized, the recovery layer routes it through one of three actions.
+
+\paragraph{Immediate deterministic repair.}
+If the failure matches a known operator family with low-cost, checkable remediation, the system applies that operator before another model round.
+
+\paragraph{Contextualized model retry.}
+If the failure is not safely repairable or if deterministic repair has already been exhausted, the next LLM round receives the updated diagnostic context rather than only the original target description.
+
+\paragraph{Escalation or abandonment.}
+If repeated attempts do not make progress, the system can record the slice as a harder negative and move on rather than burning additional budget without evidence of progress.
+
+\subsection{Recovery Classes}
+
+This routing policy naturally yields a recovery-oriented view of outcomes. The system's behavior can be described by recovery classes such as:
+
+\begin{itemize}[leftmargin=1.4em]
+    \item dormant or model-only negative,
+    \item prompt-first positive,
+    \item repair-engaged negative,
+    \item repair-assisted positive.
+\end{itemize}
+
+These classes are conceptually important because they make the contribution legible. A final coverage increase alone cannot distinguish whether the system succeeded because repair mattered, because the prompt was already sufficient, or because the negative path became more semantically meaningful even without a final win.
+
+\section{Bounded Tool-First Fixpoint}
+\label{sec:fixpoint}
+
+\subsection{Why a Fixpoint Is Necessary}
+
+A single deterministic repair is often insufficient. In practice, one shallow failure can mask a second, deeper failure. For example, a malformed Python test may first require call-shape repair and then expose an oracle mismatch. A Go test may require cleanup of a brittle line-count expectation before the next attempt reaches the behavior that actually matters. A repair mechanism that stops after one rewrite cannot exploit these cascades.
+
+\subsection{Why the Fixpoint Must Be Bounded}
+
+At the same time, deterministic repair cannot become an unbounded patching loop. Without an explicit limit, the system risks turning repair into uncontrolled local search, thereby weakening the paper's systems claim and making outcomes harder to interpret. We therefore use a bounded tool-first fixpoint:
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item apply a deterministic operator when the current diagnostic warrants it,
+    \item re-run the candidate or recompute the next diagnostic,
+    \item either continue for a small fixed number of passes or stop when no new progress is detected,
+    \item only then fall back to another model round.
+\end{enumerate}
+
+Boundedness makes repair a principled part of the retry loop rather than an opaque secondary optimizer.
+
+\subsection{Executability Controls Inside the Fixpoint}
+
+One subtle but important design choice is to treat lightweight executability controls as part of the fixpoint story rather than as external engineering glue. For instance, if a repaired test becomes too large to pass a backend constraint, a small size-aware compaction step can be understood as clearing an executability gate inside the same bounded recovery process. This matters for the paper because it keeps the systems narrative coherent: executability, repair, and retry are part of one loop.
+
+\section{Language-Specific Instantiations}
+\label{sec:languages}
+
+The operators themselves are not the main novelty of the paper. Their role is to instantiate the shared recovery abstraction in languages with different dominant failure families.
+
+\subsection{Python}
+
+Python currently exposes two especially common families.
+
+\paragraph{Call-shape and framework API misuse.}
+Generated tests may use decorators, mocks, or framework-specific helpers with invalid argument ordering or incorrect patch targets. These failures are often shallow and highly amenable to deterministic normalization.
+
+\paragraph{Oracle and output brittleness.}
+After executability is restored, the next failure often lies in assertions: a test checks the wrong exception field, patches the wrong object, or overfits to a concrete string. Small output- and oracle-oriented operators are therefore useful in moving the frontier from surface syntax to actual behavior.
+
+\subsection{Go}
+
+Go highlights a different set of dominant issues.
+
+\paragraph{Public-surface and helper-process behavior.}
+Generated tests often assume getters, channels, or helper-process interfaces that do not exist or that are not the correct public surface for the repository's command-line abstractions.
+
+\paragraph{Output semantics and brittle formatting.}
+Even when the right public surface is used, candidate tests frequently overfit to exact line counts or string formatting. This motivates operators that normalize output assertions and reduce unnecessary brittleness while keeping the behavioral signal intact.
+
+\subsection{Rust}
+
+Rust remains the hardest of the current language set.
+
+\paragraph{Imports, types, and ownership.}
+Generated tests can fail at the crate, module, or ownership level before they ever exercise the target logic. These failures often demand stronger language-aware handling than their Python or Go counterparts.
+
+\paragraph{Hard semantic slices.}
+Even after shallow issues are resolved, hard Rust targets frequently surface deeper behavioral misunderstandings. This does not weaken the paper's main claim; rather, it shows why the multi-language story should be framed as a shared control loop facing different dominant failure layers.
+
+\section{Implementation}
+\label{sec:implementation}
+
+\subsection{System Components}
+
+The prototype implementation is organized into several major components.
+
+\paragraph{Coverage and target selection.}
+The system measures project coverage, extracts target segments, and tracks the current set of uncovered or under-covered regions.
+
+\paragraph{Prompt orchestration.}
+The generator assembles language-specific prompts from a shared control policy and target-specific context, optionally including reachability hints and recent diagnostic information.
+
+\paragraph{Diagnostic and repair layer.}
+Failures are normalized into \texttt{DiagnosticIR}, routed through a repair orchestrator, and optionally recorded in a reflective memory structure used to summarize lessons from earlier attempts.
+
+\paragraph{Trace logging and analysis.}
+The system emits structured traces that capture outcome class, repair passes, representative fixes, and coverage deltas. This trace structure is what later enables recovery-path-centric evaluation rather than coverage-only reporting.
+
+\subsection{Auxiliary Control Mechanisms}
+
+Several auxiliary mechanisms sit inside the same control loop.
+
+\paragraph{Memory.}
+When repeated failures reveal recurring lessons, the system can summarize them and inject them into subsequent attempts. Memory is not presented as an independent headline contribution; rather, it is one mechanism inside the larger recovery architecture.
+
+\paragraph{Planning and target ordering.}
+The system supports explicit target selection and attempt-allocation policies. Again, these are not the main novelty of the paper. Their role is to help the recovery loop decide where to spend limited effort.
+
+\paragraph{Blocker extraction.}
+Reachability hints and blockers are best understood as prompt-shaping mechanisms inside the orchestration layer, not as standalone claims.
+
+\subsection{Web-Based Demo and Artifact Layer}
+
+Although not central to the scientific claim, the implementation also includes a web-based control console that supports repository upload, task execution, result inspection, and downloading newly generated tests. This layer is useful for reproducible demos, artifact packaging, and future technology transfer, but it is not the conceptual center of the paper. In the paper narrative, it should be described as an artifact and deployment convenience rather than as a primary research contribution.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{LLM-Based Test Generation}
+
+Recent work has shown that LLMs can help escape local plateaus in search-based testing and can directly generate or improve unit tests for realistic projects~\cite{lemieux2023codamosa,alshahwan2024testgenllm}. \textsc{CoverUp} demonstrated the effectiveness of iterative, coverage-guided prompting for Python~\cite{pizzorno2025coverup}. This line of work establishes that coverage-guided LLM test generation is viable, but it still leaves open the problem of how failed attempts should be handled after generation.
+
+\subsection{Program-Analysis-Assisted Pipelines}
+
+A second line of work combines LLMs with stronger program analysis. ASTER studies natural and multi-language unit test generation~\cite{pan2024aster}; PALM and Panta demonstrate that richer analysis can materially improve unit test generation on difficult code bases and languages~\cite{chu2025palm,gu2025panta}. We build on the same broad intuition that coverage alone is insufficient, but our emphasis is different. Rather than positioning the contribution as stronger analysis per se, we focus on structured recovery after failure and on keeping one control plane across languages.
+
+\subsection{Hard-Language Test Generation}
+
+Rust-focused systems such as RUG and PALM make an important point for our work: difficult languages expose different dominant failure modes and frequently require more than generic prompting~\cite{cheng2025rug,chu2025palm}. This observation directly supports our decision to present the multi-language contribution as a failure-layer study rather than as a simple language-count claim.
+
+\subsection{Industrial Practice and Critique}
+
+Industrial reports on LLM-assisted test improvement emphasize validation, filtering, and practical engineering constraints~\cite{alshahwan2024testgenllm}. At the same time, recent critique has shown that design choices in LLM-based test generation can suppress true bug finding by encouraging passing behavior over fault revelation~\cite{mathews2024designchoices}. We take that critique seriously and deliberately scope our claims toward regression-oriented structured recovery under coverage guidance rather than toward bug discovery.
+
+\section{Discussion and Claim Boundaries}
+\label{sec:discussion}
+
+\subsection{What the Paper Is Actually About}
+
+The paper should not be read as a ``three languages plus a planner'' system paper. Nor should it be read as a generic agent paper. The core contribution is that it makes coverage-guided retry \emph{structured}. Coverage tells the system where execution is missing. Structured recovery tells the system why an attempt failed and how to react before retrying.
+
+This distinction has three implications.
+
+\begin{enumerate}[leftmargin=1.4em]
+    \item The central object is the recovery loop, not the prompt template.
+    \item The multi-language contribution is a shared control plane facing different dominant failure layers, not merely support for multiple syntaxes.
+    \item Deterministic operators are important because they instantiate the recovery abstraction, not because any one operator family is itself the main novelty.
+\end{enumerate}
+
+\subsection{Why Recovery Paths Matter}
+
+Coverage-only reporting hides crucial information. Two systems can achieve the same final coverage through very different mechanisms: one may succeed because the prompt was already good enough, while another may require several repair passes and a carefully updated diagnostic context. Conversely, two systems may both fail, yet one may reveal a much more meaningful semantic frontier than the other. A recovery-path-centric evaluation philosophy follows directly from this observation.
+
+\subsection{What We Can Safely Claim}
+
+Given the current state of the project, the paper can safely claim that:
+
+\begin{itemize}[leftmargin=1.4em]
+    \item failed attempts should be handled according to failure layer rather than as homogeneous retries;
+    \item one diagnosis-and-repair abstraction can organize recovery across multiple languages;
+    \item bounded tool-first recovery is a real systems mechanism, not just post-hoc patching;
+    \item cross-language behavior differs meaningfully by dominant failure layer.
+\end{itemize}
+
+\subsection{What We Should Not Claim}
+
+Equally important, the paper should not claim:
+
+\begin{itemize}[leftmargin=1.4em]
+    \item stable cross-language dominance,
+    \item uniform language maturity,
+    \item reliable bug-finding,
+    \item or benchmark-scale generalization that has not yet been experimentally established.
+\end{itemize}
+
+Respecting these boundaries will strengthen the paper by keeping the thesis aligned with the current evidence.
+
+\section{Threats to Validity and Limitations}
+\label{sec:threats}
+
+\subsection{Current Evidence Is Still Targeted}
+
+The strongest current evidence is mechanism-oriented and slice-oriented rather than benchmark-wide. This is a feature for early systems validation, but it also limits external generalization. The paper should therefore be explicit that current claims derive from targeted, trace-centered studies rather than from large benchmark sweeps.
+
+\subsection{Language Maturity Is Uneven}
+
+The recovery loop is shared, but the language-specific operators are not equally mature. Positive evidence in Python and selected Go tasks does not imply comparable maturity in all Rust scenarios. The paper should frame this asymmetry as an observed boundary, not hide it.
+
+\subsection{Recovery Quality Depends on Validation Infrastructure}
+
+The system's behavior depends not only on prompts and operators but also on accurate backend execution, faithful failure classification, and reliable trace logging. Bugs in any of these layers can distort both system behavior and the evaluation of that behavior. This is a general threat to work on LLM-based software engineering systems and should be acknowledged explicitly.
+
+\subsection{Coverage Is Not Equivalent to Correctness}
+
+Even when a generated test increases coverage and passes validation, it does not necessarily improve fault-detection power. A passing test can still encode a weak or even misleading oracle~\cite{mathews2024designchoices}. Our paper is therefore about structured recovery in regression-oriented test generation, not about comprehensive correctness guarantees.
+
+\section{Evaluation}
+
+\subsection{Evaluation Goals}
+
+The evaluation should be designed around the central claim of the paper: the main contribution is a structured recovery loop, not merely another prompting pipeline. Accordingly, the experimental chapter should answer four questions.
+
+\paragraph{EQ1: Does failure-layer-aware recovery change the recovery path relative to a retry-only baseline?}
+This is the most important question because it directly tests whether the loop is real as a systems mechanism.
+
+\paragraph{EQ2: Which parts of the loop matter most?}
+At minimum, the chapter should isolate the contribution of bounded tool-first repair and reachability-oriented guidance. Memory and planning can be treated as secondary ablations if budget permits, but they should not dominate the chapter.
+
+\paragraph{EQ3: How do dominant failure layers differ across languages under the same control loop?}
+The paper's multi-language contribution should be evaluated as a failure-layer study, not as a language-count claim.
+
+\paragraph{EQ4: What is the cost-efficiency trade-off of structured recovery?}
+The full loop should be evaluated not only for terminal gains but also for repair engagement, wasted attempts, and cost per useful outcome.
+
+\subsection{Two-Track Evaluation Structure}
+
+The experimental chapter should be organized into two tracks.
+
+\paragraph{Track A: mechanism-oriented targeted slices.}
+This track is the closest match to the paper's thesis. It should use a small cross-language slice set and report trace-derived recovery classes, observed paths, repair passes, fixpoint exhaustion, and representative fixes. The point of this track is to show how the loop behaves.
+
+\paragraph{Track B: small aggregated project suite.}
+This track should complement the slice study with project-level outcomes such as final coverage, terminal good/failed/useless counts, and cost. Its role is to show that the mechanism-level story is not restricted to a single hand-picked case. Because the paper does not claim benchmark-wide dominance, this suite can remain deliberately small and balanced.
+
+Coverage therefore remains a headline outcome metric in the paper. The right stance is not to downplay coverage, but to report it together with recovery-path evidence. In practical terms, the mechanism-oriented slice study should establish \emph{why} the system behaves differently, while the aggregated suite should establish \emph{whether those differences translate into higher final coverage, larger coverage deltas, or better cost-normalized gains}.
+
+\subsection{Compared Systems}
+
+The main comparisons should be chosen to support causal claims rather than to maximize the number of systems in a table.
+
+\paragraph{Full system.}
+The complete failure-layer-aware recovery loop, including reachability hints, diagnosis, bounded tool-first repair, and the current language-specific operators.
+
+\paragraph{Retry-only baseline.}
+The strongest simple baseline should keep the same model, target-selection policy, and prompt family whenever possible, but disable recovery-specific mechanisms. This is the primary comparison because it isolates the value of structured recovery from the value of mere prompting.
+
+\paragraph{No-fixpoint ablation.}
+This comparison disables deterministic repair while keeping the rest of the orchestration intact. It is the most direct way to test the bounded tool-first contribution.
+
+\paragraph{No-blocker ablation.}
+This comparison removes reachability-oriented guidance. Its purpose is to test whether the system benefits from knowing not only where coverage is missing but also why the target may be hard to reach.
+
+\paragraph{Optional secondary ablations.}
+If budget permits, the chapter can add no-memory and no-planning variants. These should appear after the main repair-oriented comparisons and should not be written as the core of the contribution.
+
+\paragraph{External prior systems.}
+External comparisons require caution. A direct numerical comparison is appropriate only when a prior system can be reproduced on overlapping repositories with comparable models, prompts, and coverage definitions. Otherwise, prior work should be compared qualitatively in the related-work section or in discussion rather than used as a main headline table.
+
+For this reason, external tool comparison should be stratified rather than forced into one universal table. The most realistic paper-facing policy is:
+\begin{itemize}[leftmargin=1.4em]
+    \item use the retry-only baseline as the main causal comparison across all languages;
+    \item compare against the closest prior Python coverage-guided system on the Python subset if reproducibility conditions can be matched;
+    \item compare against Rust-specific prior systems only on overlapping Rust repositories and only if repository revision, coverage definition, and model configuration can be aligned;
+    \item keep broader prior systems as qualitative positioning when those conditions are not met.
+\end{itemize}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.18\textwidth} >{\raggedright\arraybackslash}p{0.24\textwidth} >{\raggedright\arraybackslash}X}
+\toprule
+Variant & Configuration role & Paper purpose \\
+\midrule
+Full & complete recovery loop with diagnosis, bounded repair, and reachability guidance & main system \\
+Retry-only baseline & same model and task budget without recovery-specific mechanisms & main causal baseline \\
+No-fixpoint & full loop without deterministic repair before retry & isolates bounded repair contribution \\
+No-blocker & full loop without reachability-oriented hints & isolates reachability guidance contribution \\
+No-memory / No-planning & optional secondary ablations & appendix or secondary analysis only \\
+\bottomrule
+\end{tabularx}
+\caption{Recommended evaluation variants. The paper's core causal story should be built around the first four rows.}
+\label{tab:eval-variants}
+\end{table}
+
+\subsection{Subjects}
+
+\paragraph{Targeted slice set.}
+The mechanism track should use a small but deliberately diverse slice set across Python, Go, and Rust. The set should include:
+\begin{itemize}[leftmargin=1.4em]
+    \item at least one repair-assisted positive slice in Python,
+    \item at least one repair-assisted positive slice in Go,
+    \item at least one prompt-first positive slice,
+    \item at least one harder repair-engaged negative slice,
+    \item at least one Rust paired contrast to represent the hardest language family.
+\end{itemize}
+
+\paragraph{Aggregated project suite.}
+The project-level track should use a balanced suite with at least two repositories per language. A practical submission-oriented configuration is a six-project suite with three seeds and four primary variants (full, retry-only baseline, no-fixpoint, no-blocker). If time permits, the suite can later be expanded toward the currently configured nine-project matrix.
+
+The main-paper suite should therefore be intentionally modest and balanced. A six-project suite is large enough to show that the method is not tied to one hand-picked case, yet still small enough to run with multiple seeds and controlled ablations. A larger nine-project suite can be retained as an extended experiment or appendix once the main-paper matrix is stable.
+
+\subsection{Metrics}
+
+Because the method is about recovery behavior, the chapter should elevate trace-derived metrics to first-class status.
+
+\paragraph{Primary metrics.}
+\begin{itemize}[leftmargin=1.4em]
+    \item final line coverage and branch coverage when available,
+    \item absolute coverage delta over the original repository test suite,
+    \item terminal good/failed/useless outcomes derived from trace,
+    \item recovery-class distribution,
+    \item repair-engagement rate,
+    \item average repair passes,
+    \item fixpoint-exhaustion rate,
+    \item cost and cost per useful outcome.
+\end{itemize}
+
+\paragraph{Secondary metrics.}
+\begin{itemize}[leftmargin=1.4em]
+    \item wall-clock time,
+    \item number of memory lessons or summaries,
+    \item failure-family composition by language.
+\end{itemize}
+
+An important methodological rule is that trace-derived terminal outcomes should take precedence over raw summary counters whenever bounded repair causes multiple internal failure events within one externally visible attempt.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabularx}{\textwidth}{>{\raggedright\arraybackslash}p{0.25\textwidth} >{\raggedright\arraybackslash}p{0.2\textwidth} >{\raggedright\arraybackslash}X}
+\toprule
+Metric & Type & Purpose \\
+\midrule
+Final line / branch coverage & effectiveness & main outcome visible to reviewers \\
+Coverage delta over initial suite & effectiveness & makes improvement relative to the original repository explicit \\
+Terminal G / F / U & effectiveness + efficiency & distinguishes successful, failed, and non-useful end states \\
+Recovery-class distribution & mechanism & shows whether slices are prompt-first, repair-assisted, or still negative \\
+Repair-engagement rate & mechanism & quantifies whether repair is active or dormant \\
+Average repair passes & mechanism & measures how much bounded repair is actually used \\
+Fixpoint-exhaustion rate & mechanism & shows where repair stalls before benefit \\
+Cost / cost per good outcome & efficiency & ties gains to resource use \\
+Failure-family composition & explanatory & supports the cross-language failure-layer claim \\
+\bottomrule
+\end{tabularx}
+\caption{Recommended metrics for the evaluation chapter. Coverage remains a headline outcome, but it should be reported together with recovery-path evidence.}
+\label{tab:eval-metrics}
+\end{table}
+
+\subsection{Protocol}
+
+For fairness and reproducibility, all direct comparisons should share:
+\begin{itemize}[leftmargin=1.4em]
+    \item the same repository revision,
+    \item the same model and temperature,
+    \item the same maximum attempt budget,
+    \item the same backend validation pipeline,
+    \item fresh workspaces and clean repository extraction per run,
+    \item explicit seed reporting when seeds are supported.
+\end{itemize}
+
+The chapter should also state the exact date on which the model configuration was frozen, because hosted LLM behavior can drift over time even under the same nominal model name.
+
+\subsection{Planned Result Organization}
+
+The final experimental section should present results in the following order.
+
+\paragraph{1. Mechanism table first.}
+The first main result should be a trace-centered table reporting recovery class, observed path, repair engagement, average repair passes, and representative fixes for the targeted slice set.
+
+\paragraph{2. Paired baseline sanity second.}
+The second result should show full versus retry-only outcomes on the most informative paired slices. This table should distinguish:
+\begin{itemize}[leftmargin=1.4em]
+    \item full-loop-dependent positives,
+    \item prompt-first positives,
+    \item harder negative paired contrasts.
+\end{itemize}
+
+\paragraph{3. Aggregated project table third.}
+Only after the recovery-path evidence has been established should the paper present project-level coverage, coverage deltas, terminal outcomes, and cost. This table should be written so that a reviewer can immediately see both effectiveness and efficiency: final coverage, coverage gain over the original suite, terminal G/F/U, and cost per good outcome.
+
+\paragraph{4. Failure-layer composition figure fourth.}
+A cross-language figure should summarize which failure families dominate in Python, Go, and Rust under the same orchestration loop.
+
+\paragraph{5. Case studies last.}
+One repair-assisted positive case and one harder negative case should close the section, because together they explain both the strength and the current boundary of the method.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\linewidth}{\centering
+\vspace{1.8cm}
+Placeholder for per-project coverage delta figure\\
+\small full vs.\ retry-only baseline vs.\ no-fixpoint vs.\ no-blocker\\
+\vspace{1.8cm}}}
+\caption{Per-project coverage delta over the original repository test suite. This figure should provide the most direct effectiveness view of the chapter.}
+\label{fig:coverage-delta}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\linewidth}{\centering
+\vspace{1.8cm}
+Placeholder for cross-language failure-family composition figure\\
+\small Python vs.\ Go vs.\ Rust under the same orchestration loop\\
+\vspace{1.8cm}}}
+\caption{Failure-family composition by language. This figure should support the claim that the same control loop encounters different dominant failure layers across languages.}
+\label{fig:failure-family}
+\end{figure}
+
+\subsection{What the Evaluation Should Not Do}
+
+The chapter should avoid three common mistakes.
+
+\begin{itemize}[leftmargin=1.4em]
+    \item It should not treat final coverage as the only headline metric.
+    \item It should not compare against prior published systems using mismatched repositories, models, or coverage definitions as if those comparisons were causal.
+    \item It should not frame every positive slice as evidence that the full recovery loop was necessary.
+\end{itemize}
+
+Under these constraints, the experimental chapter can remain modest in scale while still being strong in argument. That is the right fit for the current thesis of the paper.
+
+\section{Conclusion}
+
+Coverage-guided LLM test generation has reached the point where target selection is no longer the only systems problem. Once an attempt fails, the quality of the retry loop becomes central. This paper argues that retries should be failure-layer-aware: failed attempts should be normalized into structured diagnostics, routed through bounded deterministic recovery when appropriate, and only then retried with the model.
+
+The broader significance of this framing is twofold. First, it turns a previously coarse generation loop into a structured recovery system. Second, it makes the multi-language story defensible by grounding it in a shared control plane rather than in a loose collection of language-specific prompts. The project now has a coherent thesis, a method that matches that thesis, and an implementation that exposes recovery behavior as a first-class object. Completing the experimental section will determine the ultimate strength of the paper, but the non-experimental core is now in place: a systems argument for structured recovery under coverage guidance.
+
+\bibliographystyle{unsrt}
+\bibliography{references}
+
+\end{document}
