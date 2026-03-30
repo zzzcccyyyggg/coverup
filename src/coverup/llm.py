@@ -14,12 +14,32 @@ with warnings.catch_warnings():
     warnings.simplefilter('ignore')
     import litellm  # type: ignore
 
+# Suppress pydantic serialization warnings globally (litellm + pydantic 2.x compat)
+warnings.filterwarnings('ignore', message='.*PydanticSerializationUnexpectedValue.*')
+warnings.filterwarnings('ignore', message='.*Pydantic serializer warnings.*')
+
 # Turn off most logging
 litellm.set_verbose = False
 litellm.suppress_debug_info = True
 logging.getLogger().setLevel(logging.ERROR)
 # Ignore unavailable parameters
 litellm.drop_params = True
+
+# Register custom proxy models that litellm doesn't recognize natively.
+# This ensures features like function calling are properly detected.
+_CUSTOM_PROXY_MODELS = os.environ.get("COVERUP_CUSTOM_MODELS", "").split(",")
+for _cm in _CUSTOM_PROXY_MODELS:
+    _cm = _cm.strip()
+    if _cm:
+        litellm.register_model({
+            _cm: {
+                "max_tokens": 8192,
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0,
+                "litellm_provider": "openai",
+                "supports_function_calling": True,
+            }
+        })
 
 # Tier 5 rate limits for models; tuples indicate limit and interval in seconds
 # Extracted from https://platform.openai.com/account/limits on 8/30/2024
@@ -204,11 +224,6 @@ class Chatter:
             **(self._extra_request_pars if self._extra_request_pars else {})
         }
 
-        # ✅ 自动支持 DeepSeek API
-        if "deepseek" in self._model:
-            req["api_base"] = "https://api.deepseek.com"
-            req["api_key"] = os.environ.get("DEEPSEEK_API_KEY")
-
         return req
 
 
@@ -226,7 +241,17 @@ class Chatter:
                         self._log_msg(ctx, f"Error: too many tokens for rate limit ({e})")
                         return None # gives up this segment
 
-                return await litellm.acreate(**request)
+                return await asyncio.wait_for(
+                    litellm.acompletion(**request),
+                    timeout=300  # 5 minute safety timeout per LLM call
+                )
+
+            except asyncio.TimeoutError:
+                self._log_msg(ctx, f"Error: LLM call timed out after 300s, retrying")
+                self._signal_retry()
+                import random
+                sleep = min(sleep * 2, self._max_backoff)
+                await asyncio.sleep(random.uniform(sleep / 2, sleep))
 
             except (litellm.exceptions.ServiceUnavailableError,
                     openai.RateLimitError,
@@ -268,7 +293,12 @@ class Chatter:
                 return None # gives up this segment
 
     def _call_function(self, ctx: object, tool_call: litellm.ModelResponse) -> str:
-        args = json.loads(tool_call.function.arguments)
+        try:
+            args = json.loads(tool_call.function.arguments)
+        except json.JSONDecodeError as e:
+            self._log_msg(ctx, f"Error: invalid JSON in tool call arguments for \"{tool_call.function.name}\": {e}\nraw arguments: {tool_call.function.arguments!r}")
+            return f'Error: invalid JSON in tool call arguments: {e}'
+
         function = self._functions[tool_call.function.name]
 
         try:

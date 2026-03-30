@@ -3,10 +3,14 @@ import argparse
 import typing as T
 
 from ..segment import CodeSegment
+from ..diagnostic_ir import DiagnosticIR, DiagnosticIRBuilder, classify_error_text, Phase
 
 
 class LanguageBackend(abc.ABC):
     """Abstract interface implemented by language-specific backends."""
+
+    # The language identifier for Diagnostic IR ("python" | "go" | "rust")
+    language_id: str = ""
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -78,6 +82,26 @@ class LanguageBackend(abc.ABC):
         """Formats raw test output before presenting it to the model."""
 
         return output
+
+    def classify_error(self, output: str, phase: str = "compile") -> DiagnosticIR:
+        """Classify a test error into a structured DiagnosticIR.
+
+        Subclasses should override for more precise classification.
+        The default implementation uses the generic heuristic classifier.
+        """
+        formatted = self.format_test_error(output)
+        cat, code = classify_error_text(output, self.language_id)
+        return (
+            DiagnosticIRBuilder(language=self.language_id, phase=phase)
+            .fail()
+            .tool(self._default_tool_name())
+            .error(cat, code, formatted)
+            .build()
+        )
+
+    def _default_tool_name(self) -> str:
+        """Return tool name for DiagnosticIR (overrideable)."""
+        return self.language_id
 
     def initial_empty_coverage(self) -> dict:
         """Provides a synthetic zero-coverage snapshot when no baseline run exists."""

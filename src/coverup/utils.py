@@ -49,12 +49,21 @@ def lines_branches_do(lines: T.Set[int], neg_lines: T.Set[int], branches: T.Set[
     return s
 
 
-async def subprocess_run(args: T.Sequence[str], check: bool = False, timeout: T.Optional[int] = None) -> subprocess.CompletedProcess:
+async def subprocess_run(
+    args: T.Sequence[str],
+    check: bool = False,
+    timeout: T.Optional[int] = None,
+    cwd: T.Optional[T.Union[str, Path]] = None,
+) -> subprocess.CompletedProcess:
     """Provides an asynchronous version of subprocess.run"""
     import asyncio
 
-    process = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE,
-                                                   stderr=asyncio.subprocess.STDOUT)
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=str(cwd) if cwd is not None else None,
+    )
 
     try:
         if timeout is not None:
